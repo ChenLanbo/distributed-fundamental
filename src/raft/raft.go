@@ -209,12 +209,16 @@ func (leader *RaftLeader) Stopped() bool {
 func (leader *RaftLeader) ReplicateLogs() {
     for !leader.Stopped() {
         shuffle := rand.Perm(len(leader.rf.peers))
+
+        term := leader.rf.store.GetTerm()
         for _, server := range shuffle {
             if server == leader.rf.me {
                 continue
             }
 
-            request := &AppendEntriesArgs{LeaderId:leader.rf.me}
+            request := &AppendEntriesArgs{}
+            request.LeaderId = leader.rf.me
+            request.Term = term
             reply := &AppendEntriesReply{}
             leader.rf.sendAppendEntries(server, request, reply)
 
@@ -292,9 +296,10 @@ func (candidate *RaftCandidate) Run() {
         select {
         case higherTerm := <- candidate.newTermChan:
             if newTerm <= higherTerm {
-                candidate.rf.setState(FOLLOWER)
                 candidate.Pause()
                 candidate.Stop()
+                candidate.rf.setState(FOLLOWER)
+                candidate.rf.store.SetTerm(higherTerm)
                 return
             }
         case isNewLeader := <- candidate.voteChan:
@@ -345,14 +350,16 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
         return
     }
 
-    request := RequestVoteArgs{}
+    request := &RequestVoteArgs{}
     request.CandidateId = candidate.rf.me
     request.Term = newTerm
     request.LatestLogTerm = latestLogTerm
     request.LatestLogIndex = latestLogIndex
 
-    reply := RequestVoteReply{}
+
     numSuccess := 1
+    replyChan := make(chan bool, len(candidate.rf.peers))
+    defer close(replyChan)
 
     // Send votes to other peers
     shuffle := rand.Perm(len(candidate.rf.peers))
@@ -365,26 +372,39 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
             return
         }
 
-        if candidate.rf.sendRequestVote(server, &request, &reply) {
-            if reply.VoteGranted {
-                numSuccess++
-            } else if newTerm < reply.Term {
-                candidate.newTermChan <- reply.Term
-                return
-            }
-        }
-        log.Println(candidate.rf.me, ": sent vote request to", server)
+        go func(server int) {
+            defer func() {
+                if r := recover(); r != nil {
+                    // ignore error
+                }
+            } ()
 
-        // if numSuccess > len(shuffle) / 2 {
-        //     candidate.voteChan <- true
-        //     return
-        // }
+            log.Println(candidate.rf.me, ": sending vote request to", server)
+            reply := &RequestVoteReply{}
+            success := false
+
+            if candidate.rf.sendRequestVote(server, request, reply) {
+                if reply.VoteGranted {
+                    success = true
+                } else if newTerm < reply.Term {
+                    candidate.newTermChan <- reply.Term
+                }
+            }
+            replyChan <- success
+        } (server)
     }
 
-    if numSuccess > len(shuffle) / 2 {
-        candidate.voteChan <- true
-    } else {
-        candidate.voteChan <- false
+    for i := 0; i < len(candidate.rf.peers) - 1; i++ {
+        success := <- replyChan
+        if success {
+            numSuccess++
+        }
+
+        if numSuccess > len(shuffle) / 2 {
+            candidate.voteChan <- true
+        } else {
+            candidate.voteChan <- false
+        }
     }
 }
 
@@ -420,6 +440,11 @@ func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
         } else if op.AppendRequest != nil {
             reply := AppendEntriesReply{}
             op.AppendCallback <- reply
+
+            if term < op.AppendRequest.Term {
+                candidate.newTermChan <- op.VoteRequest.Term
+                return
+            }
         }
     }
 }
@@ -491,11 +516,14 @@ func (follower *RaftFollower) Run() {
                 op.VoteCallback <- reply
             } else if op.AppendRequest != nil {
                 // TODO: implementation TBD
+                if follower.rf.store.GetTerm() <= op.AppendRequest.Term {
+                    follower.rf.store.SetVotedFor(op.AppendRequest.LeaderId)
+                }
                 lastSawAppend = time.Now().UnixNano()
                 reply := AppendEntriesReply{}
                 op.AppendCallback <- reply
             }
-        case <- time.After(time.Millisecond * time.Duration(100 + rand.Int31n(100))):
+        case <- time.After(time.Millisecond * time.Duration(256 + rand.Int31n(100))):
             if time.Now().UnixNano() - lastSawAppend > int64(time.Second) {
                 follower.rf.setState(CANDIDATE)
                 follower.Stop()
@@ -641,7 +669,7 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-    log.Println(rf.me, ": receives vote request.")
+    log.Println(rf.me, ": receives vote request from", args.CandidateId)
     op := &RaftOperation{}
     op.VoteRequest = args
     op.VoteCallback = make(chan RequestVoteReply, 1)
@@ -696,6 +724,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //
 type AppendEntriesArgs struct {
     LeaderId int
+    Term int
 }
 
 //
