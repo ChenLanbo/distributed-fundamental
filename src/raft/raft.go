@@ -17,8 +17,15 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+    "log"
+    "math/rand"
+    "sync"
+    "sync/atomic"
+    "time"
+
+    "labrpc"
+)
 
 // import "bytes"
 // import "encoding/gob"
@@ -49,17 +56,20 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+    stop int32
+    state RaftState
+    store *Store
+    queue chan *RaftOperation
 
+    role RaftComponent
+    roleMu sync.Mutex
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	return rf.store.GetState()
 }
 
 //
@@ -93,8 +103,516 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+func (rf *Raft) setState(state RaftState) {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    rf.state = state
+}
 
+func (rf *Raft) run() {
+    go func() {
+        for !rf.Killed() {
+            switch rf.state {
+            case LEADER:
+                log.Println(rf.me, ": run as a leader.")
+                rf.role = MakeLeader(rf)
+            case CANDIDATE:
+                log.Println(rf.me, ": run as a candidate.")
+                rf.role = MakeCandidate(rf)
+            case FOLLOWER:
+                log.Println(rf.me, ": run as a follower.")
+                rf.role = MakeFollower(rf)
+            }
+            rf.role.Run()
+        }
+    } ()
+}
 
+//
+// State of a peer: leader, candidate or follower
+//
+type RaftState int
+const (
+    LEADER RaftState = iota + 1
+    CANDIDATE
+    FOLLOWER
+)
+
+//
+// Generic interface of a peer roll
+//
+type RaftComponent interface {
+    Run()
+    Stop()
+    Stopped() bool
+}
+
+//
+// Leader component
+//
+type RaftLeader struct {
+    rf *Raft
+    mu sync.Mutex
+    newTermChan chan int
+    stop int32
+}
+
+func MakeLeader(rf *Raft) *RaftLeader {
+    leader := &RaftLeader{}
+    leader.rf = rf
+    leader.stop = 0
+    return leader
+}
+
+func (leader *RaftLeader) Run() {
+    leader.rf.roleMu.Lock()
+    defer leader.rf.roleMu.Unlock()
+
+    if leader.rf.state != LEADER {
+        // Log error
+        log.Println(leader.rf.me, ": not in leader state.")
+        return
+    }
+
+    // Process requests
+    go func() {
+        leader.ReplicateLogs()
+    } ()
+
+    go func() {
+        leader.ProcessRequests()
+    } ()
+
+    select {
+    case newTerm := <- leader.newTermChan:
+        if leader.rf.store.GetTerm() < newTerm {
+            leader.Stop()
+            leader.rf.store.SetTerm(newTerm)
+            leader.rf.setState(FOLLOWER)
+            return
+        }
+    }
+}
+
+func (leader *RaftLeader) Stop() {
+    leader.mu.Lock()
+    defer leader.mu.Unlock()
+    leader.stop = 1
+}
+
+func (leader *RaftLeader) Stopped() bool {
+    leader.mu.Lock()
+    defer leader.mu.Unlock()
+    return leader.stop == 1
+}
+
+func (leader *RaftLeader) ReplicateLogs() {
+    for !leader.Stopped() {
+        shuffle := rand.Perm(len(leader.rf.peers))
+        for _, server := range shuffle {
+            if server == leader.rf.me {
+                continue
+            }
+
+            request := &AppendEntriesArgs{LeaderId:leader.rf.me}
+            reply := &AppendEntriesReply{}
+            leader.rf.sendAppendEntries(server, request, reply)
+
+            // Sleep
+            time.Sleep(time.Millisecond * time.Duration(64))
+        }
+    }
+}
+
+func (leader *RaftLeader) ProcessRequests() {
+    for !leader.Stopped() {
+        op := <- leader.rf.queue
+
+        if op.VoteRequest != nil {
+            if leader.rf.store.GetTerm() < op.VoteRequest.Term {
+                leader.newTermChan <- op.VoteRequest.Term
+                return
+            }
+        } else if op.AppendRequest != nil {
+            // TBD
+        }
+    }
+}
+
+//
+// Candidate component
+//
+type RaftCandidate struct {
+    rf *Raft
+    mu sync.Mutex
+    voteChan chan bool
+    newTermChan chan int
+    voteMu sync.Mutex
+    processMu sync.Mutex
+    stop int32
+    pause int32
+}
+
+func MakeCandidate(rf *Raft) *RaftCandidate {
+    candidate := &RaftCandidate{}
+    candidate.rf = rf
+    candidate.voteChan = make(chan bool, 1)
+    candidate.newTermChan = make(chan int, 1)
+    candidate.stop = 0
+    candidate.pause = 0
+    return candidate
+}
+
+func (candidate *RaftCandidate) Run() {
+    candidate.rf.roleMu.Lock()
+    defer candidate.rf.roleMu.Unlock()
+
+    if candidate.rf.state != CANDIDATE {
+        // Log error
+        log.Println(candidate.rf.me, ": not in candidate state.")
+        return
+    }
+
+    // Process requests
+    candidate.rf.store.SetVotedFor(-1)
+    for !candidate.Stopped() {
+        newTerm := candidate.rf.store.IncrementTerm()
+        latestLogTerm, latestLogIndex := candidate.rf.store.GetLatestLogTermAndIndex()
+
+        log.Println(candidate.rf.me, ": start vote at term", newTerm)
+
+        go func() {
+            candidate.VoteAtTerm(newTerm, latestLogTerm, latestLogIndex)
+        } ()
+
+        go func() {
+            candidate.ProcessRequestsAtTerm(newTerm)
+        } ()
+
+        select {
+        case higherTerm := <- candidate.newTermChan:
+            if newTerm <= higherTerm {
+                candidate.rf.setState(FOLLOWER)
+                candidate.Pause()
+                candidate.Stop()
+                return
+            }
+        case isNewLeader := <- candidate.voteChan:
+            if isNewLeader {
+                log.Println(candidate.rf.me, "win vote")
+                candidate.Pause()
+                candidate.Stop()
+                candidate.rf.setState(LEADER)
+                candidate.rf.store.SetVotedFor(candidate.rf.me)
+                return
+            } else {
+                candidate.Pause()
+                time.Sleep(time.Millisecond * time.Duration(rand.Int31n(100) + 64))
+            }
+        }
+    }
+}
+
+func (candidate *RaftCandidate) Stop() {
+    candidate.mu.Lock()
+    defer candidate.mu.Unlock()
+    candidate.stop = 1
+}
+
+func (candidate *RaftCandidate) Stopped() bool {
+    candidate.mu.Lock()
+    defer candidate.mu.Unlock()
+    return candidate.stop == 1
+}
+
+func (candidate *RaftCandidate) Pause() {
+    candidate.mu.Lock()
+    defer candidate.mu.Unlock()
+    candidate.pause = 1
+}
+
+func (candidate *RaftCandidate) Paused() bool {
+    candidate.mu.Lock()
+    defer candidate.mu.Unlock()
+    return candidate.pause == 1
+}
+
+func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogIndex int) {
+    candidate.voteMu.Lock()
+    defer candidate.voteMu.Unlock()
+
+    if candidate.Stopped() {
+        return
+    }
+
+    request := RequestVoteArgs{}
+    request.CandidateId = candidate.rf.me
+    request.Term = newTerm
+    request.LatestLogTerm = latestLogTerm
+    request.LatestLogIndex = latestLogIndex
+
+    reply := RequestVoteReply{}
+    numSuccess := 1
+
+    // Send votes to other peers
+    shuffle := rand.Perm(len(candidate.rf.peers))
+    for _, server := range shuffle {
+        if server == candidate.rf.me {
+            continue
+        }
+        if candidate.Paused() {
+            log.Println(candidate.rf.me, ": candidate paused.")
+            return
+        }
+
+        if candidate.rf.sendRequestVote(server, &request, &reply) {
+            if reply.VoteGranted {
+                numSuccess++
+            } else if newTerm < reply.Term {
+                candidate.newTermChan <- reply.Term
+                return
+            }
+        }
+        log.Println(candidate.rf.me, ": sent vote request to", server)
+
+        // if numSuccess > len(shuffle) / 2 {
+        //     candidate.voteChan <- true
+        //     return
+        // }
+    }
+
+    if numSuccess > len(shuffle) / 2 {
+        candidate.voteChan <- true
+    } else {
+        candidate.voteChan <- false
+    }
+}
+
+func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
+    candidate.processMu.Lock()
+    defer candidate.processMu.Unlock()
+
+    if candidate.Stopped() {
+        return
+    }
+
+    for !candidate.Paused() {
+        var op *RaftOperation = nil
+        select {
+        case op = <- candidate.rf.queue:
+            // Noop
+        case <- time.After(time.Millisecond * time.Duration(100)):
+            // Noop
+        }
+
+        if op == nil {
+            continue
+        }
+
+        if op.VoteRequest != nil {
+            reply := RequestVoteReply{VoteGranted:false, Term:term}
+            op.VoteCallback <- reply
+
+            if term < op.VoteRequest.Term {
+                candidate.newTermChan <- op.VoteRequest.Term
+                return
+            }
+        } else if op.AppendRequest != nil {
+            reply := AppendEntriesReply{}
+            op.AppendCallback <- reply
+        }
+    }
+}
+
+//
+// Follower component
+//
+type RaftFollower struct {
+    rf *Raft
+    mu sync.Mutex
+    stop int32
+}
+
+func MakeFollower(rf *Raft) *RaftFollower {
+    follower := &RaftFollower{}
+    follower.rf = rf
+    follower.stop = 0
+    return follower
+}
+
+func (follower *RaftFollower) Run() {
+    follower.rf.roleMu.Lock()
+    defer follower.rf.roleMu.Unlock()
+
+    if follower.rf.state != FOLLOWER {
+        // Log error
+        log.Println(follower.rf.me, ": not in follower state.")
+        return
+    }
+
+    lastSawAppend := time.Now().UnixNano()
+
+    // Process requests
+    for !follower.Stopped() {
+        success := false
+        select {
+        case op := <- follower.rf.queue:
+            if op.VoteRequest != nil {
+                myTerm := follower.rf.store.GetTerm()
+                if op.VoteRequest.Term == myTerm {
+                    if op.VoteRequest.CandidateId ==
+                        follower.rf.store.GetVotedFor() &&
+                       follower.rf.store.OtherPeerLogMoreUpToDate(
+                        op.VoteRequest.CandidateId,
+                        op.VoteRequest.LatestLogTerm,
+                        op.VoteRequest.LatestLogIndex) {
+                        success = true
+                        lastSawAppend = time.Now().UnixNano()
+                   }
+                } else if op.VoteRequest.Term > myTerm {
+                    if follower.rf.store.OtherPeerLogMoreUpToDate(
+                        op.VoteRequest.CandidateId,
+                        op.VoteRequest.LatestLogTerm,
+                        op.VoteRequest.LatestLogIndex) {
+                        success = true
+                        follower.rf.store.SetVotedFor(
+                            op.VoteRequest.CandidateId)
+                        lastSawAppend = time.Now().UnixNano()
+                    }
+                    follower.rf.store.SetTerm(op.VoteRequest.Term)
+                }
+
+                log.Println(follower.rf.me, ": follower votes candidate ",
+                            op.VoteRequest.CandidateId, success)
+
+                reply := RequestVoteReply{}
+                reply.VoteGranted = success
+                reply.Term = myTerm
+                op.VoteCallback <- reply
+            } else if op.AppendRequest != nil {
+                // TODO: implementation TBD
+                lastSawAppend = time.Now().UnixNano()
+                reply := AppendEntriesReply{}
+                op.AppendCallback <- reply
+            }
+        case <- time.After(time.Millisecond * time.Duration(100 + rand.Int31n(100))):
+            if time.Now().UnixNano() - lastSawAppend > int64(time.Second) {
+                follower.rf.setState(CANDIDATE)
+                follower.Stop()
+                return
+            }
+        }
+    }
+}
+
+func (follower *RaftFollower) Stop() {
+    atomic.StoreInt32(&follower.stop, 1)
+}
+
+func (follower *RaftFollower) Stopped() bool {
+    return atomic.LoadInt32(&follower.stop) == 1
+}
+
+//
+// Log & Store component
+//
+type Log struct {
+    Term int
+    Index int
+    Command interface{}
+}
+
+type Store struct {
+    rf *Raft
+    currentTerm int
+    votedFor int
+    logs []Log
+    mu sync.Mutex
+}
+
+func MakeNewStore(rf *Raft) *Store {
+    store := &Store{}
+    store.rf = rf
+    store.currentTerm = 0
+    store.votedFor = -1
+    store.logs = make([]Log, 1)
+    store.logs[0] = Log{Term:0, Index:0, Command:nil}
+    return store
+}
+
+func (s *Store) GetTerm() int {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    return s.currentTerm
+}
+
+func (s *Store) IncrementTerm() int {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.currentTerm++
+    return s.currentTerm
+}
+
+func (s *Store) SetTerm(term int) int {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if s.currentTerm < term {
+        s.currentTerm = term
+    }
+    return s.currentTerm
+}
+
+func (s *Store) GetVotedFor() int {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    return s.votedFor
+}
+
+func (s *Store) SetVotedFor(newLeader int) int {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.votedFor = newLeader
+    return s.votedFor
+}
+
+func (s *Store) GetState() (int, bool) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    log.Println(s.rf.me, "term:", s.currentTerm, "votedFor:", s.votedFor)
+    return s.currentTerm, s.votedFor == s.rf.me
+}
+
+func (s *Store) GetLatestLogTermAndIndex() (int, int) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    latest := len(s.logs) - 1
+    return s.logs[latest].Term, s.logs[latest].Index
+}
+
+// Checks if another peer's log is at least up to date as my log:
+//
+// Returns:
+//   true if peerLogTerm > latestLogTerm or
+//        if peerLogTerm == latestLogTerm and peerLogIndex >= latestLogIndex
+func (s *Store) OtherPeerLogMoreUpToDate(peerId, peerLogTerm, peerLogIndex int) bool {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    latestLogTerm := s.logs[len(s.logs) - 1].Term
+    latestLogIndex := s.logs[len(s.logs) - 1].Index
+
+    if latestLogTerm != peerLogTerm {
+        return peerLogTerm > latestLogTerm
+    } else {
+        return peerLogIndex >= latestLogIndex
+    }
+}
+
+// TODO(lanbochen): implementation TBD
+func (s *Store) Append(command interface{}) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -102,6 +620,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+    CandidateId int
+    Term int
+    LatestLogTerm int
+    LatestLogIndex int
 }
 
 //
@@ -110,6 +632,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+    VoteGranted bool
+    Term int
 }
 
 //
@@ -117,6 +641,20 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+    log.Println(rf.me, ": receives vote request.")
+    op := &RaftOperation{}
+    op.VoteRequest = args
+    op.VoteCallback = make(chan RequestVoteReply, 1)
+    defer close(op.VoteCallback)
+    op.AppendRequest = nil
+    op.AppendCallback = make(chan AppendEntriesReply, 1)
+    defer close(op.AppendCallback)
+
+    rf.queue <- op
+
+    result := <- op.VoteCallback
+    reply.VoteGranted = result.VoteGranted
+    reply.Term = result.Term
 }
 
 //
@@ -153,6 +691,48 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+//
+// AppendEntries args
+//
+type AppendEntriesArgs struct {
+    LeaderId int
+}
+
+//
+// AppendEntries reply
+//
+type AppendEntriesReply struct {
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+    log.Println(rf.me, ": receives append request from", args.LeaderId)
+    op := &RaftOperation{}
+    op.VoteRequest = nil
+    op.VoteCallback = make(chan RequestVoteReply, 1)
+    defer close(op.VoteCallback)
+    op.AppendRequest = args
+    op.AppendCallback = make(chan AppendEntriesReply, 1)
+    defer close(op.AppendCallback)
+
+    rf.queue <- op
+
+    _ = <- op.AppendCallback
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+//
+// RaftOperation encapsulates the context of a RPC request from a peer
+//
+type RaftOperation struct {
+    VoteRequest *RequestVoteArgs
+    VoteCallback chan RequestVoteReply
+    AppendRequest *AppendEntriesArgs
+    AppendCallback chan AppendEntriesReply
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -186,10 +766,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+    atomic.StoreInt32(&rf.stop, 1)
+    if rf.role != nil {
+        log.Println(rf.me, ": stop.")
+        rf.role.Stop()
+    }
+}
+
+func (rf *Raft) Killed() bool {
+    return atomic.LoadInt32(&rf.stop) == 1
 }
 
 //
-// the service or tester wants to create a Raft server. the ports
+// The service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
 // have the same order. persister is a place for this server to
@@ -207,10 +796,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+    rf.state = FOLLOWER
+    rf.store = MakeNewStore(rf)
+    rf.role = nil
+    rf.queue = make(chan *RaftOperation, 1)
 
-	// initialize from state persisted before a crash
+	// Initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+    // Start this peer
+    rf.run()
 
 	return rf
 }
