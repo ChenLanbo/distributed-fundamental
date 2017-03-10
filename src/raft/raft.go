@@ -246,11 +246,12 @@ func (leader *RaftLeader) ProcessRequests() {
 //
 // Candidate component
 //
+type HigherTermAndLeader struct {LeaderId, Term int}
 type RaftCandidate struct {
     rf *Raft
     mu sync.Mutex
     voteChan chan bool
-    newTermChan chan int
+    newTermChan chan HigherTermAndLeader
     voteMu sync.Mutex
     processMu sync.Mutex
     stop int32
@@ -261,7 +262,7 @@ func MakeCandidate(rf *Raft) *RaftCandidate {
     candidate := &RaftCandidate{}
     candidate.rf = rf
     candidate.voteChan = make(chan bool, 1)
-    candidate.newTermChan = make(chan int, 1)
+    candidate.newTermChan = make(chan HigherTermAndLeader, 1)
     candidate.stop = 0
     candidate.pause = 0
     return candidate
@@ -284,6 +285,7 @@ func (candidate *RaftCandidate) Run() {
         latestLogTerm, latestLogIndex := candidate.rf.store.GetLatestLogTermAndIndex()
 
         log.Println(candidate.rf.me, ": start vote at term", newTerm)
+        candidate.Unpause()
 
         go func() {
             candidate.VoteAtTerm(newTerm, latestLogTerm, latestLogIndex)
@@ -295,12 +297,18 @@ func (candidate *RaftCandidate) Run() {
 
         select {
         case higherTerm := <- candidate.newTermChan:
-            if newTerm <= higherTerm {
-                candidate.Pause()
-                candidate.Stop()
-                candidate.rf.setState(FOLLOWER)
-                candidate.rf.store.SetTerm(higherTerm)
-                return
+            if newTerm <= higherTerm.Term {
+                if higherTerm.LeaderId == -1 {
+                    candidate.Pause()
+                    candidate.rf.store.SetTerm(higherTerm.Term)
+                } else {
+                    candidate.Pause()
+                    candidate.Stop()
+                    candidate.rf.setState(FOLLOWER)
+                    candidate.rf.store.SetTerm(higherTerm.Term)
+                    candidate.rf.store.SetVotedFor(higherTerm.LeaderId)
+                    return
+                }
             }
         case isNewLeader := <- candidate.voteChan:
             if isNewLeader {
@@ -312,9 +320,9 @@ func (candidate *RaftCandidate) Run() {
                 return
             } else {
                 candidate.Pause()
-                time.Sleep(time.Millisecond * time.Duration(rand.Int31n(100) + 64))
             }
         }
+        time.Sleep(time.Millisecond * time.Duration(rand.Int31n(100) + 64))
     }
 }
 
@@ -334,6 +342,12 @@ func (candidate *RaftCandidate) Pause() {
     candidate.mu.Lock()
     defer candidate.mu.Unlock()
     candidate.pause = 1
+}
+
+func (candidate *RaftCandidate) Unpause() {
+    candidate.mu.Lock()
+    defer candidate.mu.Unlock()
+    candidate.pause = 0
 }
 
 func (candidate *RaftCandidate) Paused() bool {
@@ -387,7 +401,8 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
                 if reply.VoteGranted {
                     success = true
                 } else if newTerm < reply.Term {
-                    candidate.newTermChan <- reply.Term
+                    higherTerm := HigherTermAndLeader{LeaderId:-1, Term:reply.Term}
+                    candidate.newTermChan <- higherTerm
                 }
             }
             replyChan <- success
@@ -434,15 +449,17 @@ func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
             op.VoteCallback <- reply
 
             if term < op.VoteRequest.Term {
-                candidate.newTermChan <- op.VoteRequest.Term
+                higherTerm := HigherTermAndLeader {LeaderId:-1, Term:op.VoteRequest.Term}
+                candidate.newTermChan <- higherTerm
                 return
             }
         } else if op.AppendRequest != nil {
             reply := AppendEntriesReply{}
             op.AppendCallback <- reply
 
-            if term < op.AppendRequest.Term {
-                candidate.newTermChan <- op.VoteRequest.Term
+            if term <= op.AppendRequest.Term {
+                higherTerm := HigherTermAndLeader {LeaderId:op.AppendRequest.LeaderId, Term:op.AppendRequest.Term}
+                candidate.newTermChan <- higherTerm
                 return
             }
         }
