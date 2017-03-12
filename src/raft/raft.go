@@ -129,7 +129,7 @@ func (rf *Raft) run() {
 }
 
 //
-// State of a peer: leader, candidate or follower
+// State of a peer: leader, candidate or follower.
 //
 type RaftState int
 const (
@@ -137,6 +137,11 @@ const (
     CANDIDATE
     FOLLOWER
 )
+
+//
+// Struct that wraps a higher term and the peer sends it.
+//
+type HigherTerm struct {PeerId, Term int}
 
 //
 // Generic interface of a peer roll
@@ -246,12 +251,11 @@ func (leader *RaftLeader) ProcessRequests() {
 //
 // Candidate component
 //
-type HigherTermAndLeader struct {LeaderId, Term int}
 type RaftCandidate struct {
     rf *Raft
     mu sync.Mutex
     voteChan chan bool
-    newTermChan chan HigherTermAndLeader
+    newTermChan chan HigherTerm
     voteMu sync.Mutex
     processMu sync.Mutex
     stop int32
@@ -262,7 +266,7 @@ func MakeCandidate(rf *Raft) *RaftCandidate {
     candidate := &RaftCandidate{}
     candidate.rf = rf
     candidate.voteChan = make(chan bool, 1)
-    candidate.newTermChan = make(chan HigherTermAndLeader, 1)
+    candidate.newTermChan = make(chan HigherTerm, 1)
     candidate.stop = 0
     candidate.pause = 0
     return candidate
@@ -298,7 +302,7 @@ func (candidate *RaftCandidate) Run() {
         select {
         case higherTerm := <- candidate.newTermChan:
             if newTerm <= higherTerm.Term {
-                if higherTerm.LeaderId == -1 {
+                if higherTerm.PeerId == -1 {
                     candidate.Pause()
                     candidate.rf.store.SetTerm(higherTerm.Term)
                 } else {
@@ -306,7 +310,7 @@ func (candidate *RaftCandidate) Run() {
                     candidate.Stop()
                     candidate.rf.setState(FOLLOWER)
                     candidate.rf.store.SetTerm(higherTerm.Term)
-                    candidate.rf.store.SetVotedFor(higherTerm.LeaderId)
+                    candidate.rf.store.SetVotedFor(higherTerm.PeerId)
                     return
                 }
             }
@@ -370,7 +374,6 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
     request.LatestLogTerm = latestLogTerm
     request.LatestLogIndex = latestLogIndex
 
-
     numSuccess := 1
     replyChan := make(chan bool, len(candidate.rf.peers))
     defer close(replyChan)
@@ -401,7 +404,7 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
                 if reply.VoteGranted {
                     success = true
                 } else if newTerm < reply.Term {
-                    higherTerm := HigherTermAndLeader{LeaderId:-1, Term:reply.Term}
+                    higherTerm := HigherTerm {PeerId:-1, Term:reply.Term}
                     candidate.newTermChan <- higherTerm
                 }
             }
@@ -449,7 +452,7 @@ func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
             op.VoteCallback <- reply
 
             if term < op.VoteRequest.Term {
-                higherTerm := HigherTermAndLeader {LeaderId:-1, Term:op.VoteRequest.Term}
+                higherTerm := HigherTerm {PeerId:-1, Term:op.VoteRequest.Term}
                 candidate.newTermChan <- higherTerm
                 return
             }
@@ -457,8 +460,12 @@ func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
             reply := AppendEntriesReply{}
             op.AppendCallback <- reply
 
+            // New AppendEntries RPC from another server claiming to be
+            // leader. If the leader’s term (included in its RPC) is at least
+            // as large as the candidate’s current term, then the candidate
+            // recognizes the leader as legitimate and returns to follower state.
             if term <= op.AppendRequest.Term {
-                higherTerm := HigherTermAndLeader {LeaderId:op.AppendRequest.LeaderId, Term:op.AppendRequest.Term}
+                higherTerm := HigherTerm {PeerId:op.AppendRequest.LeaderId, Term:op.AppendRequest.Term}
                 candidate.newTermChan <- higherTerm
                 return
             }
@@ -687,13 +694,8 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
     log.Println(rf.me, ": receives vote request from", args.CandidateId)
-    op := &RaftOperation{}
-    op.VoteRequest = args
-    op.VoteCallback = make(chan RequestVoteReply, 1)
-    defer close(op.VoteCallback)
-    op.AppendRequest = nil
-    op.AppendCallback = make(chan AppendEntriesReply, 1)
-    defer close(op.AppendCallback)
+    op := MakeRaftOperation(args, nil)
+    defer op.Stop()
 
     rf.queue <- op
 
@@ -752,13 +754,8 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     log.Println(rf.me, ": receives append request from", args.LeaderId)
-    op := &RaftOperation{}
-    op.VoteRequest = nil
-    op.VoteCallback = make(chan RequestVoteReply, 1)
-    defer close(op.VoteCallback)
-    op.AppendRequest = args
-    op.AppendCallback = make(chan AppendEntriesReply, 1)
-    defer close(op.AppendCallback)
+    op := MakeRaftOperation(nil, args)
+    defer op.Stop()
 
     rf.queue <- op
 
@@ -778,6 +775,20 @@ type RaftOperation struct {
     VoteCallback chan RequestVoteReply
     AppendRequest *AppendEntriesArgs
     AppendCallback chan AppendEntriesReply
+}
+
+func MakeRaftOperation(voteRequest *RequestVoteArgs, appendRequest *AppendEntriesArgs) *RaftOperation {
+    op := &RaftOperation{}
+    op.VoteRequest = voteRequest
+    op.VoteCallback = make(chan RequestVoteReply, 1)
+    op.AppendRequest = appendRequest
+    op.AppendCallback = make(chan AppendEntriesReply, 1)
+    return op
+}
+
+func (op *RaftOperation) Stop() {
+    close(op.VoteCallback)
+    close(op.AppendCallback)
 }
 
 //
