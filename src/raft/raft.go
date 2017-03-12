@@ -20,6 +20,7 @@ package raft
 import (
     "log"
     "math/rand"
+    "sort"
     "sync"
     "sync/atomic"
     "time"
@@ -156,15 +157,23 @@ type RaftComponent interface {
 // Leader component
 //
 type RaftLeader struct {
-    rf *Raft
     mu sync.Mutex
-    newTermChan chan int
+    rf *Raft
+    newTermChan chan HigherTerm
+    replicators []*LogReplicator
+    committer *LogCommitter
     stop int32
 }
 
 func MakeLeader(rf *Raft) *RaftLeader {
     leader := &RaftLeader{}
     leader.rf = rf
+    leader.newTermChan = make(chan HigherTerm, 1)
+    leader.replicators = make([]*LogReplicator, len(leader.rf.peers))
+    for i := 0; i < len(leader.rf.peers); i++ {
+        leader.replicators[i] = MakeLogReplicator(leader, i)
+    }
+    leader.committer = MakeLogCommitter(leader)
     leader.stop = 0
     return leader
 }
@@ -181,20 +190,27 @@ func (leader *RaftLeader) Run() {
 
     // Process requests
     go func() {
-        leader.ReplicateLogs()
-    } ()
-
-    go func() {
         leader.ProcessRequests()
     } ()
 
-    select {
-    case newTerm := <- leader.newTermChan:
-        if leader.rf.store.GetTerm() < newTerm {
+    go func() {
+        for _, replicator := range(leader.replicators) {
+            go func() {
+                replicator.ReplicateLogs()
+            } ()
+        }
+    } ()
+
+    for {
+        higherTerm := <- leader.newTermChan
+        if leader.rf.store.GetTerm() < higherTerm.Term {
             leader.Stop()
-            leader.rf.store.SetTerm(newTerm)
+            leader.rf.store.SetTerm(higherTerm.Term)
+            leader.rf.store.SetVotedFor(-1)
             leader.rf.setState(FOLLOWER)
             return
+        } else {
+            // ignore
         }
     }
 }
@@ -211,7 +227,7 @@ func (leader *RaftLeader) Stopped() bool {
     return leader.stop == 1
 }
 
-func (leader *RaftLeader) ReplicateLogs() {
+/* func (leader *RaftLeader) ReplicateLogs() {
     for !leader.Stopped() {
         shuffle := rand.Perm(len(leader.rf.peers))
 
@@ -231,19 +247,152 @@ func (leader *RaftLeader) ReplicateLogs() {
             time.Sleep(time.Millisecond * time.Duration(64))
         }
     }
-}
+} */
 
 func (leader *RaftLeader) ProcessRequests() {
     for !leader.Stopped() {
         op := <- leader.rf.queue
 
         if op.VoteRequest != nil {
+            reply := RequestVoteReply{VoteGranted:false, Term:leader.rf.store.GetTerm()}
+            op.VoteCallback <- reply
+
             if leader.rf.store.GetTerm() < op.VoteRequest.Term {
-                leader.newTermChan <- op.VoteRequest.Term
+                higherTerm := HigherTerm{PeerId:op.VoteRequest.CandidateId, Term:op.VoteRequest.Term}
+                leader.newTermChan <- higherTerm
                 return
             }
         } else if op.AppendRequest != nil {
-            // TBD
+            reply := AppendEntriesReply{Term:leader.rf.store.GetTerm(), Success:false}
+            op.AppendCallback <- reply
+
+            if leader.rf.store.GetTerm() < op.AppendRequest.Term {
+                higherTerm := HigherTerm{PeerId:op.AppendRequest.LeaderId, Term:op.AppendRequest.Term}
+                leader.newTermChan <- higherTerm
+            }
+        }
+    }
+}
+
+//
+// Log replicator component
+//
+type LogReplicator struct {
+    mu sync.Mutex
+    leader *RaftLeader
+    peer int
+    replIndex int
+    prevLog Log
+}
+
+func MakeLogReplicator(leader *RaftLeader, peer int) *LogReplicator {
+    repl := &LogReplicator{}
+    repl.leader = leader
+    repl.peer = peer
+    repl.replIndex = leader.rf.store.GetCommitIndex()
+    _, repl.prevLog = leader.rf.store.Read(repl.replIndex)
+    return repl
+}
+
+func (repl *LogReplicator) GetReplIndex() int {
+    repl.mu.Lock()
+    defer repl.mu.Unlock()
+    return repl.replIndex
+}
+
+func (repl *LogReplicator) IncrementReplIndex() {
+    repl.mu.Lock()
+    defer repl.mu.Unlock()
+    repl.replIndex++
+}
+
+func (repl *LogReplicator) DecrementReplIndex() {
+    repl.mu.Lock()
+    defer repl.mu.Unlock()
+    if repl.replIndex > 0 {
+        repl.replIndex--
+    }
+}
+
+func (repl *LogReplicator) ReplicateLogs() {
+    if repl.peer == repl.leader.rf.me {
+        return
+    }
+
+    for !repl.leader.Stopped() {
+
+        request := &AppendEntriesArgs{}
+        request.LeaderId = repl.leader.rf.me
+        request.Term = repl.leader.rf.store.GetTerm()
+        request.PrevLogTerm = repl.prevLog.Term
+        request.PrevLogIndex = repl.prevLog.Index
+        request.CommitIndex = repl.leader.rf.store.GetCommitIndex()
+
+        hasNewLog, nextLog := repl.leader.rf.store.Read(repl.GetReplIndex() + 1)
+        if !hasNewLog {
+            nextLog = HeartBeatLog()
+        }
+        request.Entry = nextLog
+
+        reply := &AppendEntriesReply{}
+        for !repl.leader.rf.sendAppendEntries(repl.peer, request, reply) {
+            if repl.leader.Stopped() {
+                return
+            }
+        }
+
+        if reply.Success {
+            if hasNewLog {
+                repl.IncrementReplIndex()
+                repl.prevLog = nextLog
+            } else {
+                // no new log, wait for some time
+                time.Sleep(time.Millisecond * time.Duration(64 + rand.Int31n(32)))
+            }
+        } else {
+            if request.Term < reply.Term {
+                // send to new term chan
+                repl.leader.newTermChan <- HigherTerm{PeerId:repl.peer, Term:reply.Term}
+                return
+            } else {
+                // previous log doesn't match, replicate backward
+                repl.DecrementReplIndex()
+                _, repl.prevLog = repl.leader.rf.store.Read(repl.GetReplIndex())
+            }
+        }
+    }
+}
+
+//
+// Log committer component
+//
+type LogCommitter struct {
+    leader *RaftLeader
+}
+
+func MakeLogCommitter(leader *RaftLeader) *LogCommitter {
+    committer := &LogCommitter{}
+    committer.leader = leader
+    return committer
+}
+
+func (committer *LogCommitter) CommitLogs() {
+    for !committer.leader.Stopped() {
+        replProgress := make([]int, len(committer.leader.replicators))
+        for i, replicator := range(committer.leader.replicators) {
+            if i == committer.leader.rf.me {
+                _, replProgress[i] = committer.leader.rf.store.GetLatestLogTermAndIndex()
+            } else {
+                replProgress[i] = replicator.GetReplIndex()
+            }
+        }
+
+        sort.Ints(replProgress)
+        mid := len(committer.leader.replicators) / 2
+        if committer.leader.rf.store.GetCommitIndex() < replProgress[mid] {
+            committer.leader.rf.store.SetCommitIndex(replProgress[mid])
+        } else {
+            time.Sleep(time.Millisecond * time.Duration(32))
         }
     }
 }
@@ -457,7 +606,7 @@ func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
                 return
             }
         } else if op.AppendRequest != nil {
-            reply := AppendEntriesReply{}
+            reply := AppendEntriesReply{Term:term, Success:false}
             op.AppendCallback <- reply
 
             // New AppendEntries RPC from another server claiming to be
@@ -539,12 +688,27 @@ func (follower *RaftFollower) Run() {
                 reply.Term = myTerm
                 op.VoteCallback <- reply
             } else if op.AppendRequest != nil {
-                // TODO: implementation TBD
+                success := false
+                myTerm := follower.rf.store.GetTerm()
+
                 if follower.rf.store.GetTerm() <= op.AppendRequest.Term {
+                    follower.rf.store.SetTerm(op.AppendRequest.Term)
                     follower.rf.store.SetVotedFor(op.AppendRequest.LeaderId)
+                    lastSawAppend = time.Now().UnixNano()
+
+                    if follower.rf.store.LogMatch(op.AppendRequest.PrevLogTerm,
+                        op.AppendRequest.PrevLogIndex) {
+                        success = true
+                        if op.AppendRequest.Entry.Index != -1 {
+                            follower.rf.store.Append(op.AppendRequest.Entry)
+                            follower.rf.store.SetCommitIndex(op.AppendRequest.CommitIndex)
+                        }
+                    }
                 }
-                lastSawAppend = time.Now().UnixNano()
+
                 reply := AppendEntriesReply{}
+                reply.Term = myTerm
+                reply.Success = success
                 op.AppendCallback <- reply
             }
         case <- time.After(time.Millisecond * time.Duration(256 + rand.Int31n(100))):
@@ -574,21 +738,32 @@ type Log struct {
     Command interface{}
 }
 
+func HeartBeatLog() Log {
+    return Log{Term:-1, Index:-1, Command:nil}
+}
+
 type Store struct {
     rf *Raft
     currentTerm int
     votedFor int
+    commitIndex int
+    applyIndex int
     logs []Log
+    applyChan chan ApplyMsg
     mu sync.Mutex
+    applyMu sync.Mutex
 }
 
-func MakeNewStore(rf *Raft) *Store {
+func MakeNewStore(rf *Raft, applyChan chan ApplyMsg) *Store {
     store := &Store{}
     store.rf = rf
     store.currentTerm = 0
     store.votedFor = -1
+    store.commitIndex = 0
+    store.applyIndex = 0
     store.logs = make([]Log, 1)
     store.logs[0] = Log{Term:0, Index:0, Command:nil}
+    store.applyChan = applyChan
     return store
 }
 
@@ -627,6 +802,29 @@ func (s *Store) SetVotedFor(newLeader int) int {
     return s.votedFor
 }
 
+func (s *Store) GetCommitIndex() int {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    return s.commitIndex
+}
+
+func (s *Store) SetCommitIndex(commitIndex int) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if s.commitIndex < commitIndex {
+        latest := len(s.logs) - 1
+        if latest < commitIndex {
+            s.commitIndex = latest
+        } else {
+            s.commitIndex = commitIndex
+        }
+
+        go func() {
+            s.ApplyLogs(s.commitIndex)
+        } ()
+    }
+}
+
 func (s *Store) GetState() (int, bool) {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -639,6 +837,21 @@ func (s *Store) GetLatestLogTermAndIndex() (int, int) {
     defer s.mu.Unlock()
     latest := len(s.logs) - 1
     return s.logs[latest].Term, s.logs[latest].Index
+}
+
+func (s *Store) LogMatch(term, index int) bool {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    if s.logs[len(s.logs) - 1].Index < index {
+        return false
+    }
+
+    if s.logs[index].Term != term {
+        return false
+    }
+
+    return true
 }
 
 // Checks if another peer's log is at least up to date as my log:
@@ -660,10 +873,72 @@ func (s *Store) OtherPeerLogMoreUpToDate(peerId, peerLogTerm, peerLogIndex int) 
     }
 }
 
-// TODO(lanbochen): implementation TBD
-func (s *Store) Append(command interface{}) {
+//
+// Propose a new command
+//
+func (s *Store) Propose(command interface{}) (int, int, bool) {
     s.mu.Lock()
     defer s.mu.Unlock()
+
+    isLeader := s.rf.me == s.votedFor
+    nextLogTerm := s.currentTerm
+    nextLogIndex := s.logs[len(s.logs) - 1].Index + 1
+
+    if isLeader {
+        newLog := Log{Term:nextLogTerm, Index:nextLogIndex, Command:command}
+        s.logs = append(s.logs, newLog)
+    }
+
+    return nextLogIndex, nextLogTerm, isLeader
+}
+
+func (s *Store) Append(log Log) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    latest := len(s.logs) - 1
+    if s.logs[latest].Index >= log.Index {
+        s.logs = s.logs[:log.Index]
+    }
+
+    s.logs = append(s.logs, log)
+}
+
+//
+// Read the log record at index i
+//
+func (s *Store) Read(index int) (bool, Log) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+
+    latestLogIndex := s.logs[len(s.logs) - 1].Index
+    success := false
+    result := Log{}
+
+    if index <= latestLogIndex {
+        success = true
+        result = s.logs[index]
+    }
+
+    return success, result
+}
+
+//
+// Apply committed logs
+//
+func (s *Store) ApplyLogs(applyTo int) {
+    s.applyMu.Lock()
+    defer s.applyMu.Unlock()
+    // apply logs
+    for s.applyIndex + 1 <= applyTo {
+        applyMsg := ApplyMsg{}
+        applyMsg.Index = s.logs[s.applyIndex + 1].Index
+        applyMsg.Command = s.logs[s.applyIndex + 1].Command
+        applyMsg.UseSnapshot = false
+        applyMsg.Snapshot = make([]byte, 0)
+        s.applyChan <- applyMsg
+        s.applyIndex++
+    }
 }
 
 //
@@ -744,22 +1019,30 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 type AppendEntriesArgs struct {
     LeaderId int
     Term int
+    PrevLogTerm int
+    PrevLogIndex int
+    CommitIndex int
+    Entry Log
 }
 
 //
 // AppendEntries reply
 //
 type AppendEntriesReply struct {
+    Term int
+    Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-    log.Println(rf.me, ": receives append request from", args.LeaderId)
+    // log.Println(rf.me, ": receives append request from", args.LeaderId)
     op := MakeRaftOperation(nil, args)
     defer op.Stop()
 
     rf.queue <- op
 
-    _ = <- op.AppendCallback
+    result := <- op.AppendCallback
+    reply.Term = result.Term
+    reply.Success = result.Success
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -810,8 +1093,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
-
+    index, term, isLeader = rf.store.Propose(command)
 	return index, term, isLeader
 }
 
@@ -854,7 +1136,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
     rf.state = FOLLOWER
-    rf.store = MakeNewStore(rf)
+    rf.store = MakeNewStore(rf, applyCh)
     rf.role = nil
     rf.queue = make(chan *RaftOperation, 1)
 
