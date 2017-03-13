@@ -110,6 +110,19 @@ func (rf *Raft) setState(state RaftState) {
     rf.state = state
 }
 
+func (rf *Raft) getState() string {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if rf.state == LEADER {
+        return "LEADER"
+    } else if rf.state == CANDIDATE {
+        return "CANDIDATE"
+    } else if rf.state == FOLLOWER {
+        return "FOLLOWER"
+    }
+    return "BAD"
+}
+
 func (rf *Raft) run() {
     go func() {
         for !rf.Killed() {
@@ -193,12 +206,14 @@ func (leader *RaftLeader) Run() {
         leader.ProcessRequests()
     } ()
 
+    for i, _ := range(leader.replicators) {
+        go func(id int) {
+            leader.replicators[id].ReplicateLogs()
+        } (i)
+    }
+
     go func() {
-        for _, replicator := range(leader.replicators) {
-            go func() {
-                replicator.ReplicateLogs()
-            } ()
-        }
+        leader.committer.CommitLogs()
     } ()
 
     for {
@@ -227,33 +242,17 @@ func (leader *RaftLeader) Stopped() bool {
     return leader.stop == 1
 }
 
-/* func (leader *RaftLeader) ReplicateLogs() {
-    for !leader.Stopped() {
-        shuffle := rand.Perm(len(leader.rf.peers))
-
-        term := leader.rf.store.GetTerm()
-        for _, server := range shuffle {
-            if server == leader.rf.me {
-                continue
-            }
-
-            request := &AppendEntriesArgs{}
-            request.LeaderId = leader.rf.me
-            request.Term = term
-            reply := &AppendEntriesReply{}
-            leader.rf.sendAppendEntries(server, request, reply)
-
-            // Sleep
-            time.Sleep(time.Millisecond * time.Duration(64))
-        }
-    }
-} */
-
 func (leader *RaftLeader) ProcessRequests() {
+    log.Println(leader.rf.me, ": start processing requests")
     for !leader.Stopped() {
         op := <- leader.rf.queue
 
+        if op == nil {
+            continue
+        }
+
         if op.VoteRequest != nil {
+            log.Println(leader.rf.me, "get vote request from", op.VoteRequest.CandidateId)
             reply := RequestVoteReply{VoteGranted:false, Term:leader.rf.store.GetTerm()}
             op.VoteCallback <- reply
 
@@ -263,6 +262,7 @@ func (leader *RaftLeader) ProcessRequests() {
                 return
             }
         } else if op.AppendRequest != nil {
+            log.Println(leader.rf.me, "get append request from", op.AppendRequest.LeaderId)
             reply := AppendEntriesReply{Term:leader.rf.store.GetTerm(), Success:false}
             op.AppendCallback <- reply
 
@@ -319,6 +319,7 @@ func (repl *LogReplicator) ReplicateLogs() {
         return
     }
 
+    log.Println(repl.leader.rf.me, "replicating logs to", repl.peer)
     for !repl.leader.Stopped() {
 
         request := &AppendEntriesArgs{}
@@ -335,7 +336,12 @@ func (repl *LogReplicator) ReplicateLogs() {
         request.Entry = nextLog
 
         reply := &AppendEntriesReply{}
-        for !repl.leader.rf.sendAppendEntries(repl.peer, request, reply) {
+        for {
+            if repl.leader.rf.sendAppendEntries(repl.peer, request, reply) {
+                break
+            } else {
+                log.Println(repl.leader.rf.me, "error sending AppendEntries to", repl.peer)
+            }
             if repl.leader.Stopped() {
                 return
             }
@@ -347,7 +353,7 @@ func (repl *LogReplicator) ReplicateLogs() {
                 repl.prevLog = nextLog
             } else {
                 // no new log, wait for some time
-                time.Sleep(time.Millisecond * time.Duration(64 + rand.Int31n(32)))
+                time.Sleep(time.Millisecond * time.Duration(256 + rand.Int31n(32)))
             }
         } else {
             if request.Term < reply.Term {
@@ -431,51 +437,47 @@ func (candidate *RaftCandidate) Run() {
         return
     }
 
-    // Process requests
     candidate.rf.store.SetVotedFor(-1)
-    for !candidate.Stopped() {
-        newTerm := candidate.rf.store.IncrementTerm()
-        latestLogTerm, latestLogIndex := candidate.rf.store.GetLatestLogTermAndIndex()
 
-        log.Println(candidate.rf.me, ": start vote at term", newTerm)
-        candidate.Unpause()
+    // Process requests
+    go func() {
+        candidate.ProcessRequests()
+    } ()
 
-        go func() {
-            candidate.VoteAtTerm(newTerm, latestLogTerm, latestLogIndex)
-        } ()
+    // Vote myself as the new leader
+    go func() {
+        for !candidate.Stopped() {
+            newTerm := candidate.rf.store.IncrementTerm()
+            latestLogTerm, latestLogIndex := candidate.rf.store.GetLatestLogTermAndIndex()
 
-        go func() {
-            candidate.ProcessRequestsAtTerm(newTerm)
-        } ()
+            log.Println(candidate.rf.me, ": start vote at term", newTerm)
+            if !candidate.VoteAtTerm(newTerm, latestLogTerm, latestLogIndex) {
+                st := rand.Int31n(512) + 256
+                // log.Println(candidate.rf.me, "round", newTerm, "failed. sleep", st)
+                time.Sleep(time.Millisecond * time.Duration(st))
+            }
+        }
+    } ()
 
+    for {
         select {
         case higherTerm := <- candidate.newTermChan:
-            if newTerm <= higherTerm.Term {
-                if higherTerm.PeerId == -1 {
-                    candidate.Pause()
-                    candidate.rf.store.SetTerm(higherTerm.Term)
-                } else {
-                    candidate.Pause()
-                    candidate.Stop()
-                    candidate.rf.setState(FOLLOWER)
-                    candidate.rf.store.SetTerm(higherTerm.Term)
-                    candidate.rf.store.SetVotedFor(higherTerm.PeerId)
-                    return
-                }
+            if candidate.rf.store.GetTerm() <= higherTerm.Term {
+                candidate.Stop()
+                candidate.rf.setState(FOLLOWER)
+                candidate.rf.store.SetTerm(higherTerm.Term)
+                candidate.rf.store.SetVotedFor(higherTerm.PeerId)
+                return
             }
         case isNewLeader := <- candidate.voteChan:
             if isNewLeader {
                 log.Println(candidate.rf.me, "win vote")
-                candidate.Pause()
                 candidate.Stop()
                 candidate.rf.setState(LEADER)
                 candidate.rf.store.SetVotedFor(candidate.rf.me)
                 return
-            } else {
-                candidate.Pause()
             }
         }
-        time.Sleep(time.Millisecond * time.Duration(rand.Int31n(100) + 64))
     }
 }
 
@@ -491,7 +493,7 @@ func (candidate *RaftCandidate) Stopped() bool {
     return candidate.stop == 1
 }
 
-func (candidate *RaftCandidate) Pause() {
+/* func (candidate *RaftCandidate) Pause() {
     candidate.mu.Lock()
     defer candidate.mu.Unlock()
     candidate.pause = 1
@@ -507,15 +509,15 @@ func (candidate *RaftCandidate) Paused() bool {
     candidate.mu.Lock()
     defer candidate.mu.Unlock()
     return candidate.pause == 1
-}
+} */
 
-func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogIndex int) {
+func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogIndex int) bool {
     candidate.voteMu.Lock()
     defer candidate.voteMu.Unlock()
 
-    if candidate.Stopped() {
-        return
-    }
+    /* if candidate.Stopped() {
+        return true
+    } */
 
     request := &RequestVoteArgs{}
     request.CandidateId = candidate.rf.me
@@ -533,9 +535,9 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
         if server == candidate.rf.me {
             continue
         }
-        if candidate.Paused() {
-            log.Println(candidate.rf.me, ": candidate paused.")
-            return
+        if candidate.Stopped() {
+            log.Println(candidate.rf.me, ": candidate stopped.")
+            return true
         }
 
         go func(server int) {
@@ -569,13 +571,18 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
 
         if numSuccess > len(shuffle) / 2 {
             candidate.voteChan <- true
-        } else {
-            candidate.voteChan <- false
+            return true
         }
+    }
+    if numSuccess > len(shuffle) / 2 {
+        candidate.voteChan <- true
+        return true
+    } else {
+        return false
     }
 }
 
-func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
+func (candidate *RaftCandidate) ProcessRequests() {
     candidate.processMu.Lock()
     defer candidate.processMu.Unlock()
 
@@ -583,7 +590,7 @@ func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
         return
     }
 
-    for !candidate.Paused() {
+    for !candidate.Stopped() {
         var op *RaftOperation = nil
         select {
         case op = <- candidate.rf.queue:
@@ -596,24 +603,26 @@ func (candidate *RaftCandidate) ProcessRequestsAtTerm(term int) {
             continue
         }
 
+        myTerm := candidate.rf.store.GetTerm()
+
         if op.VoteRequest != nil {
-            reply := RequestVoteReply{VoteGranted:false, Term:term}
+            reply := RequestVoteReply{VoteGranted:false, Term:myTerm}
             op.VoteCallback <- reply
 
-            if term < op.VoteRequest.Term {
+            if candidate.rf.store.GetTerm() < op.VoteRequest.Term {
                 higherTerm := HigherTerm {PeerId:-1, Term:op.VoteRequest.Term}
                 candidate.newTermChan <- higherTerm
                 return
             }
         } else if op.AppendRequest != nil {
-            reply := AppendEntriesReply{Term:term, Success:false}
+            reply := AppendEntriesReply{Term:myTerm, Success:false}
             op.AppendCallback <- reply
 
             // New AppendEntries RPC from another server claiming to be
             // leader. If the leader’s term (included in its RPC) is at least
             // as large as the candidate’s current term, then the candidate
             // recognizes the leader as legitimate and returns to follower state.
-            if term <= op.AppendRequest.Term {
+            if candidate.rf.store.GetTerm() <= op.AppendRequest.Term {
                 higherTerm := HigherTerm {PeerId:op.AppendRequest.LeaderId, Term:op.AppendRequest.Term}
                 candidate.newTermChan <- higherTerm
                 return
@@ -655,7 +664,7 @@ func (follower *RaftFollower) Run() {
         success := false
         select {
         case op := <- follower.rf.queue:
-            if op.VoteRequest != nil {
+            if op != nil && op.VoteRequest != nil {
                 myTerm := follower.rf.store.GetTerm()
                 if op.VoteRequest.Term == myTerm {
                     if op.VoteRequest.CandidateId ==
@@ -680,18 +689,21 @@ func (follower *RaftFollower) Run() {
                     follower.rf.store.SetTerm(op.VoteRequest.Term)
                 }
 
-                log.Println(follower.rf.me, ": follower votes candidate ",
+                log.Println(follower.rf.me, ": follower votes candidate",
                             op.VoteRequest.CandidateId, success)
+                if success {
+                    lastSawAppend = time.Now().UnixNano()
+                }
 
                 reply := RequestVoteReply{}
                 reply.VoteGranted = success
                 reply.Term = myTerm
                 op.VoteCallback <- reply
-            } else if op.AppendRequest != nil {
+            } else if op != nil && op.AppendRequest != nil {
                 success := false
                 myTerm := follower.rf.store.GetTerm()
 
-                if follower.rf.store.GetTerm() <= op.AppendRequest.Term {
+                if myTerm <= op.AppendRequest.Term {
                     follower.rf.store.SetTerm(op.AppendRequest.Term)
                     follower.rf.store.SetVotedFor(op.AppendRequest.LeaderId)
                     lastSawAppend = time.Now().UnixNano()
@@ -711,10 +723,13 @@ func (follower *RaftFollower) Run() {
                 reply.Success = success
                 op.AppendCallback <- reply
             }
-        case <- time.After(time.Millisecond * time.Duration(256 + rand.Int31n(100))):
-            if time.Now().UnixNano() - lastSawAppend > int64(time.Second) {
+        // case <- time.After(time.Millisecond * time.Duration(1024 + rand.Int31n(100))):
+        case <- time.After(time.Second):
+            tt := time.Now().UnixNano() - lastSawAppend
+            if tt > int64(time.Second) {
                 follower.rf.setState(CANDIDATE)
                 follower.Stop()
+                log.Println(follower.rf.me, "leader timeout: ", tt, int64(time.Second), "switch to candidate")
                 return
             }
         }
@@ -1110,6 +1125,7 @@ func (rf *Raft) Kill() {
         log.Println(rf.me, ": stop.")
         rf.role.Stop()
     }
+    close(rf.queue)
 }
 
 func (rf *Raft) Killed() bool {
@@ -1135,6 +1151,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+    rf.stop = 0
     rf.state = FOLLOWER
     rf.store = MakeNewStore(rf, applyCh)
     rf.role = nil
