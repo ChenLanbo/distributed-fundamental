@@ -300,10 +300,10 @@ func (repl *LogReplicator) GetReplIndex() int {
     return repl.replIndex
 }
 
-func (repl *LogReplicator) IncrementReplIndex() {
+func (repl *LogReplicator) IncrementReplIndex(batch int) {
     repl.mu.Lock()
     defer repl.mu.Unlock()
-    repl.replIndex++
+    repl.replIndex += batch
 }
 
 func (repl *LogReplicator) DecrementReplIndex() {
@@ -328,12 +328,15 @@ func (repl *LogReplicator) ReplicateLogs() {
         request.PrevLogTerm = repl.prevLog.Term
         request.PrevLogIndex = repl.prevLog.Index
         request.CommitIndex = repl.leader.rf.store.GetCommitIndex()
+        request.Entries = make([]Log, 0)
 
-        hasNewLog, nextLog := repl.leader.rf.store.Read(repl.GetReplIndex() + 1)
-        if !hasNewLog {
-            nextLog = HeartBeatLog()
+        for batch := 0; batch < 8; batch++ {
+            hasNewLog, nextLog := repl.leader.rf.store.Read(repl.GetReplIndex() + batch + 1)
+            if !hasNewLog {
+                break
+            }
+            request.Entries = append(request.Entries, nextLog)
         }
-        request.Entry = nextLog
 
         reply := &AppendEntriesReply{}
         for {
@@ -350,9 +353,9 @@ func (repl *LogReplicator) ReplicateLogs() {
         }
 
         if reply.Success {
-            if hasNewLog {
-                repl.IncrementReplIndex()
-                repl.prevLog = nextLog
+            if len(request.Entries) > 0 {
+                repl.IncrementReplIndex(len(request.Entries))
+                repl.prevLog = request.Entries[len(request.Entries) - 1]
             } else {
                 // no new log, wait for some time
                 time.Sleep(time.Millisecond * time.Duration(1 + rand.Int31n(32)))
@@ -694,9 +697,9 @@ func (follower *RaftFollower) Run() {
                     if follower.rf.store.LogMatch(op.AppendRequest.PrevLogTerm,
                         op.AppendRequest.PrevLogIndex) {
                         success = true
-                        if op.AppendRequest.Entry.Index != -1 {
-                            log.Println(follower.rf.me, "adding log with index", op.AppendRequest.Entry.Index)
-                            follower.rf.store.Append(op.AppendRequest.Entry)
+                        if len(op.AppendRequest.Entries) != 0 {
+                            log.Println(follower.rf.me, "adding log with index", op.AppendRequest.Entries[0].Index)
+                            follower.rf.store.Append(op.AppendRequest.Entries)
                         }
                         follower.rf.store.SetCommitIndex(op.AppendRequest.CommitIndex)
                     }
@@ -890,16 +893,18 @@ func (s *Store) Propose(command interface{}) (int, int, bool) {
     return nextLogIndex, nextLogTerm, isLeader
 }
 
-func (s *Store) Append(log Log) {
+func (s *Store) Append(logs []Log) {
     s.mu.Lock()
     defer s.mu.Unlock()
 
     latest := len(s.logs) - 1
-    if s.logs[latest].Index >= log.Index {
-        s.logs = s.logs[:log.Index]
+    if s.logs[latest].Index >= logs[0].Index {
+        s.logs = s.logs[:logs[0].Index]
     }
 
-    s.logs = append(s.logs, log)
+    for _, log := range(logs) {
+        s.logs = append(s.logs, log)
+    }
 }
 
 //
@@ -967,12 +972,12 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+    // log.Println(rf.me, ": receives vote request from", args.CandidateId)
     defer func() {
         if r := recover(); r != nil {
             // ignore error
         }
     } ()
-    log.Println(rf.me, ": receives vote request from", args.CandidateId)
     op := MakeRaftOperation(args, nil)
     defer op.Stop()
 
@@ -1019,6 +1024,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
     go func() {
         defer func() {
             if r := recover(); r != nil {
+                // ignore error
             }
         } ()
 	    ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
@@ -1042,7 +1048,7 @@ type AppendEntriesArgs struct {
     PrevLogTerm int
     PrevLogIndex int
     CommitIndex int
-    Entry Log
+    Entries []Log
 }
 
 //
@@ -1077,6 +1083,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
     go func() {
         defer func() {
             if r := recover(); r != nil {
+                // ignore error
             }
         } ()
 	    ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
