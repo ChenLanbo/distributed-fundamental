@@ -337,11 +337,13 @@ func (repl *LogReplicator) ReplicateLogs() {
 
         reply := &AppendEntriesReply{}
         for {
+            // log.Println(repl.peer, "peer commit index", request.CommitIndex)
             if repl.leader.rf.sendAppendEntries(repl.peer, request, reply) {
                 break
             } else {
-                log.Println(repl.leader.rf.me, "error sending AppendEntries to", repl.peer)
+                // log.Println(repl.leader.rf.me, "error sending AppendEntries to", repl.peer)
             }
+
             if repl.leader.Stopped() {
                 return
             }
@@ -353,7 +355,7 @@ func (repl *LogReplicator) ReplicateLogs() {
                 repl.prevLog = nextLog
             } else {
                 // no new log, wait for some time
-                time.Sleep(time.Millisecond * time.Duration(256 + rand.Int31n(32)))
+                time.Sleep(time.Millisecond * time.Duration(1 + rand.Int31n(32)))
             }
         } else {
             if request.Term < reply.Term {
@@ -396,6 +398,7 @@ func (committer *LogCommitter) CommitLogs() {
         sort.Ints(replProgress)
         mid := len(committer.leader.replicators) / 2
         if committer.leader.rf.store.GetCommitIndex() < replProgress[mid] {
+            log.Println(committer.leader.rf.me, ": advance commit index to", replProgress[mid])
             committer.leader.rf.store.SetCommitIndex(replProgress[mid])
         } else {
             time.Sleep(time.Millisecond * time.Duration(32))
@@ -455,6 +458,8 @@ func (candidate *RaftCandidate) Run() {
                 st := rand.Int31n(512) + 256
                 // log.Println(candidate.rf.me, "round", newTerm, "failed. sleep", st)
                 time.Sleep(time.Millisecond * time.Duration(st))
+            } else {
+                break
             }
         }
     } ()
@@ -493,31 +498,9 @@ func (candidate *RaftCandidate) Stopped() bool {
     return candidate.stop == 1
 }
 
-/* func (candidate *RaftCandidate) Pause() {
-    candidate.mu.Lock()
-    defer candidate.mu.Unlock()
-    candidate.pause = 1
-}
-
-func (candidate *RaftCandidate) Unpause() {
-    candidate.mu.Lock()
-    defer candidate.mu.Unlock()
-    candidate.pause = 0
-}
-
-func (candidate *RaftCandidate) Paused() bool {
-    candidate.mu.Lock()
-    defer candidate.mu.Unlock()
-    return candidate.pause == 1
-} */
-
 func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogIndex int) bool {
     candidate.voteMu.Lock()
     defer candidate.voteMu.Unlock()
-
-    /* if candidate.Stopped() {
-        return true
-    } */
 
     request := &RequestVoteArgs{}
     request.CandidateId = candidate.rf.me
@@ -547,7 +530,7 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
                 }
             } ()
 
-            log.Println(candidate.rf.me, ": sending vote request to", server)
+            // log.Println(candidate.rf.me, ": sending vote request to", server)
             reply := &RequestVoteReply{}
             success := false
 
@@ -712,9 +695,10 @@ func (follower *RaftFollower) Run() {
                         op.AppendRequest.PrevLogIndex) {
                         success = true
                         if op.AppendRequest.Entry.Index != -1 {
+                            log.Println(follower.rf.me, "adding log with index", op.AppendRequest.Entry.Index)
                             follower.rf.store.Append(op.AppendRequest.Entry)
-                            follower.rf.store.SetCommitIndex(op.AppendRequest.CommitIndex)
                         }
+                        follower.rf.store.SetCommitIndex(op.AppendRequest.CommitIndex)
                     }
                 }
 
@@ -723,7 +707,6 @@ func (follower *RaftFollower) Run() {
                 reply.Success = success
                 op.AppendCallback <- reply
             }
-        // case <- time.After(time.Millisecond * time.Duration(1024 + rand.Int31n(100))):
         case <- time.After(time.Second):
             tt := time.Now().UnixNano() - lastSawAppend
             if tt > int64(time.Second) {
@@ -951,6 +934,7 @@ func (s *Store) ApplyLogs(applyTo int) {
         applyMsg.Command = s.logs[s.applyIndex + 1].Command
         applyMsg.UseSnapshot = false
         applyMsg.Snapshot = make([]byte, 0)
+        // log.Println(s.rf.me, "apply log with index", s.applyIndex + 1, "command", applyMsg.Command)
         s.applyChan <- applyMsg
         s.applyIndex++
     }
@@ -983,6 +967,11 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+    defer func() {
+        if r := recover(); r != nil {
+            // ignore error
+        }
+    } ()
     log.Println(rf.me, ": receives vote request from", args.CandidateId)
     op := MakeRaftOperation(args, nil)
     defer op.Stop()
@@ -1024,8 +1013,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+    ch := make(chan bool, 1)
+    defer close(ch)
+
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+            }
+        } ()
+	    ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+        ch <- ok
+    } ()
+
+    select {
+    case result := <- ch:
+        return result
+    case <- time.After(time.Millisecond * time.Duration(128)):
+        return false
+    }
 }
 
 //
@@ -1050,6 +1055,11 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     // log.Println(rf.me, ": receives append request from", args.LeaderId)
+    defer func() {
+        if r := recover(); r != nil {
+            // ignore error
+        }
+    } ()
     op := MakeRaftOperation(nil, args)
     defer op.Stop()
 
@@ -1061,8 +1071,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
+    ch := make(chan bool, 1)
+    defer close(ch)
+
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+            }
+        } ()
+	    ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+        ch <- ok
+    } ()
+
+    select {
+    case result := <- ch:
+        return result
+    case <- time.After(time.Millisecond * time.Duration(128)):
+        return false
+    }
 }
 
 //
@@ -1109,6 +1135,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
     index, term, isLeader = rf.store.Propose(command)
+    if isLeader {
+        log.Println(rf.me, "propose new command at index", index, "command", command)
+    }
 	return index, term, isLeader
 }
 
