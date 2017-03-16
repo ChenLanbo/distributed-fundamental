@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+    "bytes"
+    "encoding/gob"
     "log"
     "math/rand"
     "sort"
@@ -81,12 +83,30 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
+    rf.store.mu.Lock()
+    defer rf.store.mu.Unlock()
+    log.Println(rf.me, "save states at term", rf.store.currentTerm)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
 	// e.Encode(rf.xxx)
 	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+
+    e.Encode(rf.store.currentTerm)
+    e.Encode(rf.store.votedFor)
+    e.Encode(rf.store.commitIndex)
+    e.Encode(rf.store.applyIndex)
+
+    e.Encode(len(rf.store.logs) - 1)
+    for i, log := range(rf.store.logs) {
+        if i == 0 {
+            continue
+        }
+        e.Encode(log.Term)
+        e.Encode(log.Index)
+        e.Encode(log.Command)
+    }
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -95,13 +115,30 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+    rf.store.mu.Lock()
+    defer rf.store.mu.Unlock()
+    log.Println(rf.me, "recover data", len(data))
+    var numLogs int
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+    d.Decode(&rf.store.currentTerm)
+    d.Decode(&rf.store.votedFor)
+    d.Decode(&rf.store.commitIndex)
+    d.Decode(&rf.store.applyIndex)
+
+    d.Decode(&numLogs)
+    for i := 0; i < numLogs; i++ {
+        var l Log
+        d.Decode(&l.Term)
+        d.Decode(&l.Index)
+        d.Decode(&l.Command)
+        rf.store.logs = append(rf.store.logs, l)
+    }
+
+    log.Println(rf.me, "my starting term", rf.store.currentTerm)
 }
 
 func (rf *Raft) setState(state RaftState) {
@@ -698,7 +735,7 @@ func (follower *RaftFollower) Run() {
                         op.AppendRequest.PrevLogIndex) {
                         success = true
                         if len(op.AppendRequest.Entries) != 0 {
-                            log.Println(follower.rf.me, "adding log with index", op.AppendRequest.Entries[0].Index)
+                            log.Println(follower.rf.me, "adding log with index", op.AppendRequest.Entries[0].Index, "command", op.AppendRequest.Entries[0].Command)
                             follower.rf.store.Append(op.AppendRequest.Entries)
                         }
                         follower.rf.store.SetCommitIndex(op.AppendRequest.CommitIndex)
@@ -907,12 +944,13 @@ func (s *Store) Append(logs []Log) {
 
     latest := len(s.logs) - 1
     if s.logs[latest].Index >= logs[0].Index {
-        s.logs = s.logs[:logs[0].Index]
+        s.logs = s.logs[:logs[0].Index - 1]
     }
 
     for _, log := range(logs) {
         s.logs = append(s.logs, log)
     }
+
 }
 
 //
@@ -1169,6 +1207,8 @@ func (rf *Raft) Kill() {
         log.Println(rf.me, ": stop.")
         rf.role.Stop()
     }
+    time.Sleep(time.Millisecond * time.Duration(32))
+    rf.persist()
     close(rf.queue)
 }
 
