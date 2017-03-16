@@ -128,7 +128,7 @@ func (rf *Raft) run() {
         for !rf.Killed() {
             switch rf.state {
             case LEADER:
-                log.Println(rf.me, ": run as a leader.")
+                log.Println(rf.me, ": run as a leader at term", rf.store.GetTerm())
                 rf.role = MakeLeader(rf)
             case CANDIDATE:
                 log.Println(rf.me, ": run as a candidate.")
@@ -330,7 +330,7 @@ func (repl *LogReplicator) ReplicateLogs() {
         request.CommitIndex = repl.leader.rf.store.GetCommitIndex()
         request.Entries = make([]Log, 0)
 
-        for batch := 0; batch < 8; batch++ {
+        for batch := 0; batch < 16; batch++ {
             hasNewLog, nextLog := repl.leader.rf.store.Read(repl.GetReplIndex() + batch + 1)
             if !hasNewLog {
                 break
@@ -358,7 +358,7 @@ func (repl *LogReplicator) ReplicateLogs() {
                 repl.prevLog = request.Entries[len(request.Entries) - 1]
             } else {
                 // no new log, wait for some time
-                time.Sleep(time.Millisecond * time.Duration(1 + rand.Int31n(32)))
+                time.Sleep(time.Millisecond * time.Duration(32 + rand.Int31n(32)))
             }
         } else {
             if request.Term < reply.Term {
@@ -710,6 +710,14 @@ func (follower *RaftFollower) Run() {
                 reply.Success = success
                 op.AppendCallback <- reply
             }
+
+            tt := time.Now().UnixNano() - lastSawAppend
+            if tt > int64(time.Second) {
+                follower.rf.setState(CANDIDATE)
+                follower.Stop()
+                log.Println(follower.rf.me, "leader timeout: ", tt, int64(time.Second), "switch to candidate")
+                return
+            }
         case <- time.After(time.Second):
             tt := time.Now().UnixNano() - lastSawAppend
             if tt > int64(time.Second) {
@@ -829,7 +837,7 @@ func (s *Store) SetCommitIndex(commitIndex int) {
 func (s *Store) GetState() (int, bool) {
     s.mu.Lock()
     defer s.mu.Unlock()
-    log.Println(s.rf.me, "term:", s.currentTerm, "votedFor:", s.votedFor)
+    // log.Println(s.rf.me, "term:", s.currentTerm, "votedFor:", s.votedFor)
     return s.currentTerm, s.votedFor == s.rf.me
 }
 
