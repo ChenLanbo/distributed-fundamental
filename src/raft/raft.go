@@ -20,6 +20,7 @@ package raft
 import (
     "bytes"
     "encoding/gob"
+    "fmt"
     "log"
     "math/rand"
     "sort"
@@ -83,9 +84,6 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-    rf.store.mu.Lock()
-    defer rf.store.mu.Unlock()
-    log.Println(rf.me, "save states at term", rf.store.currentTerm)
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
 	// e.Encode(rf.xxx)
@@ -106,6 +104,7 @@ func (rf *Raft) persist() {
         e.Encode(log.Command)
     }
 	data := w.Bytes()
+    log.Println(rf.me, "save states at term", rf.store.currentTerm, "BYTES", len(data))
 	rf.persister.SaveRaftState(data)
 }
 
@@ -356,7 +355,9 @@ func (repl *LogReplicator) ReplicateLogs() {
         return
     }
 
-    log.Println(repl.leader.rf.me, "replicating logs to", repl.peer)
+    log.Println(repl.leader.rf.me,
+                "replicating logs to", repl.peer,
+                "at term", repl.prevLog.Term, "index", repl.prevLog.Index)
     for !repl.leader.Stopped() {
 
         request := &AppendEntriesArgs{}
@@ -367,7 +368,7 @@ func (repl *LogReplicator) ReplicateLogs() {
         request.CommitIndex = repl.leader.rf.store.GetCommitIndex()
         request.Entries = make([]Log, 0)
 
-        for batch := 0; batch < 16; batch++ {
+        for batch := 0; batch < 256; batch++ {
             hasNewLog, nextLog := repl.leader.rf.store.Read(repl.GetReplIndex() + batch + 1)
             if !hasNewLog {
                 break
@@ -375,7 +376,7 @@ func (repl *LogReplicator) ReplicateLogs() {
             request.Entries = append(request.Entries, nextLog)
         }
 
-        reply := &AppendEntriesReply{}
+        reply := &AppendEntriesReply{Term:0, Success:false}
         for {
             // log.Println(repl.peer, "peer commit index", request.CommitIndex)
             if repl.leader.rf.sendAppendEntries(repl.peer, request, reply) {
@@ -405,6 +406,8 @@ func (repl *LogReplicator) ReplicateLogs() {
             } else {
                 // previous log doesn't match, replicate backward
                 repl.DecrementReplIndex()
+                log.Println(repl.leader.rf.me, "replicator", repl.peer,
+                            "decrement repl index to", repl.GetReplIndex())
                 _, repl.prevLog = repl.leader.rf.store.Read(repl.GetReplIndex())
             }
         }
@@ -438,8 +441,12 @@ func (committer *LogCommitter) CommitLogs() {
         sort.Ints(replProgress)
         mid := len(committer.leader.replicators) / 2
         if committer.leader.rf.store.GetCommitIndex() < replProgress[mid] {
-            log.Println(committer.leader.rf.me, ": advance commit index to", replProgress[mid])
-            committer.leader.rf.store.SetCommitIndex(replProgress[mid])
+            // Only commit logs at current term
+            success, l := committer.leader.rf.store.Read(replProgress[mid])
+            if success && l.Term == committer.leader.rf.store.GetTerm() {
+                log.Println(committer.leader.rf.me, ": advance commit index to", replProgress[mid])
+                committer.leader.rf.store.SetCommitIndex(replProgress[mid])
+            }
         } else {
             time.Sleep(time.Millisecond * time.Duration(32))
         }
@@ -731,11 +738,12 @@ func (follower *RaftFollower) Run() {
                     follower.rf.store.SetVotedFor(op.AppendRequest.LeaderId)
                     lastSawAppend = time.Now().UnixNano()
 
-                    if follower.rf.store.LogMatch(op.AppendRequest.PrevLogTerm,
+                    if follower.rf.store.LogMatch(
+                        op.AppendRequest.LeaderId,
+                        op.AppendRequest.PrevLogTerm,
                         op.AppendRequest.PrevLogIndex) {
                         success = true
                         if len(op.AppendRequest.Entries) != 0 {
-                            log.Println(follower.rf.me, "adding log with index", op.AppendRequest.Entries[0].Index, "command", op.AppendRequest.Entries[0].Command)
                             follower.rf.store.Append(op.AppendRequest.Entries)
                         }
                         follower.rf.store.SetCommitIndex(op.AppendRequest.CommitIndex)
@@ -795,6 +803,7 @@ type Store struct {
     commitIndex int
     applyIndex int
     logs []Log
+    raftState *bytes.Buffer
     applyChan chan ApplyMsg
     mu sync.Mutex
     applyMu sync.Mutex
@@ -809,6 +818,7 @@ func MakeNewStore(rf *Raft, applyChan chan ApplyMsg) *Store {
     store.applyIndex = 0
     store.logs = make([]Log, 1)
     store.logs[0] = Log{Term:0, Index:0, Command:nil}
+    store.raftState = new(bytes.Buffer)
     store.applyChan = applyChan
     return store
 }
@@ -885,7 +895,7 @@ func (s *Store) GetLatestLogTermAndIndex() (int, int) {
     return s.logs[latest].Term, s.logs[latest].Index
 }
 
-func (s *Store) LogMatch(term, index int) bool {
+func (s *Store) LogMatch(server, term, index int) bool {
     s.mu.Lock()
     defer s.mu.Unlock()
 
@@ -893,7 +903,19 @@ func (s *Store) LogMatch(term, index int) bool {
         return false
     }
 
+    // Check fail if index does not match
+    if s.logs[index].Index != index {
+        pp := fmt.Sprint(s.rf.me, " the leader term ", term, " index ", index,
+                         " does not match log index ", s.logs[index].Index,
+                         " term ", s.logs[index].Term)
+        panic(pp)
+    }
+
     if s.logs[index].Term != term {
+        log.Println(s.rf.me,
+                    "follower log at index", index, "with term", s.logs[index].Term,
+                    "value", s.logs[index].Command,
+                    "does not match with server", server, "term", term)
         return false
     }
 
@@ -929,28 +951,58 @@ func (s *Store) Propose(command interface{}) (int, int, bool) {
     isLeader := s.rf.me == s.votedFor
     nextLogTerm := s.currentTerm
     nextLogIndex := s.logs[len(s.logs) - 1].Index + 1
+    if isLeader && nextLogIndex != len(s.logs) {
+        pp := fmt.Sprint(s.rf.me, " leader proposing log with index ", nextLogIndex,
+                    " term ", nextLogTerm, " command ", command)
+        panic(pp)
+    }
 
     if isLeader {
         newLog := Log{Term:nextLogTerm, Index:nextLogIndex, Command:command}
         s.logs = append(s.logs, newLog)
+        s.Persist(newLog)
+
+        // log.Println(s.rf.me, "leader proposing log with index", newLog.Index,
+        //             "term", newLog.Term, "command", newLog.Command)
     }
 
     return nextLogIndex, nextLogTerm, isLeader
 }
 
-func (s *Store) Append(logs []Log) {
+func (s *Store) Append(newLogs []Log) {
     s.mu.Lock()
     defer s.mu.Unlock()
 
+    for _, newLog := range(newLogs) {
+        if s.commitIndex >= newLog.Index {
+            continue
+        }
+
+        latest := len(s.logs) - 1
+        if s.logs[latest].Index >= newLog.Index {
+            s.logs = s.logs[:newLog.Index]
+        } else if s.logs[latest].Index + 1 < newLog.Index {
+            panic("***GAP***")
+        }
+        s.logs = append(s.logs, newLog)
+        // log.Println(s.rf.me, "adding log with index", newLog.Index,
+        //             "term", newLog.Term, "command", newLog.Command, "len", len(newLogs))
+        s.Persist(newLog)
+    }
+
+    /* if s.commitIndex > logs[0].Index {
+        panic("Commit index is greater than log index.")
+    }
+
     latest := len(s.logs) - 1
     if s.logs[latest].Index >= logs[0].Index {
-        s.logs = s.logs[:logs[0].Index - 1]
+        s.logs = s.logs[:logs[0].Index]
     }
 
     for _, log := range(logs) {
         s.logs = append(s.logs, log)
-    }
-
+        s.Persist(log)
+    } */
 }
 
 //
@@ -979,16 +1031,79 @@ func (s *Store) ApplyLogs(applyTo int) {
     s.applyMu.Lock()
     defer s.applyMu.Unlock()
     // apply logs
+    // start := s.applyIndex
     for s.applyIndex + 1 <= applyTo {
         applyMsg := ApplyMsg{}
         applyMsg.Index = s.logs[s.applyIndex + 1].Index
         applyMsg.Command = s.logs[s.applyIndex + 1].Command
         applyMsg.UseSnapshot = false
         applyMsg.Snapshot = make([]byte, 0)
-        // log.Println(s.rf.me, "apply log with index", s.applyIndex + 1, "command", applyMsg.Command)
         s.applyChan <- applyMsg
         s.applyIndex++
+        // log.Println(s.rf.me,
+        //             "apply log with index", s.applyIndex,
+        //             "command", applyMsg.Command,
+        //             "start", start, "commit index", applyTo)
     }
+
+    // Persist state
+    // s.rf.persist()
+}
+
+//
+// Used internally by other methods
+//
+func (s *Store) Persist(l Log) {
+    e := gob.NewEncoder(s.raftState)
+
+    e.Encode(s.currentTerm)
+    e.Encode(s.votedFor)
+    e.Encode(s.commitIndex)
+    e.Encode(s.applyIndex)
+    e.Encode(l.Term)
+    e.Encode(l.Index)
+    // Using & will correct encode the Command
+    e.Encode(&l.Command)
+
+    // log.Println(s.rf.me, "persist raft state len:", s.raftState.Len(),
+    //             "command", l.Term, l.Index, l.Command)
+    s.rf.persister.SaveRaftState(s.raftState.Bytes())
+}
+
+func (s *Store) ReadPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+    dataCopy := make([]byte, len(data))
+    copy(dataCopy, data)
+    s.raftState = bytes.NewBuffer(dataCopy)
+
+    r := bytes.NewBuffer(data)
+    d := gob.NewDecoder(r)
+    for {
+        if d.Decode(&s.currentTerm) != nil {
+            break;
+        }
+
+        d.Decode(&s.votedFor)
+        d.Decode(&s.commitIndex)
+        d.Decode(&s.applyIndex)
+
+        var l Log
+        d.Decode(&l.Term)
+        d.Decode(&l.Index)
+        d.Decode(&l.Command)
+        if l.Index < len(s.logs) {
+            s.logs[l.Index] = l
+        } else {
+            s.logs = append(s.logs, l)
+        }
+    }
+
+    // log.Println(s.rf.me, "recover data --- term", s.currentTerm,
+    //             "commit", s.commitIndex, "apply", s.applyIndex,
+    //             "log length", len(s.logs))
 }
 
 //
@@ -1186,10 +1301,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (2B).
     index, term, isLeader = rf.store.Propose(command)
     if isLeader {
-        log.Println(rf.me, "propose new command at index", index, "command", command)
+        // log.Println(rf.me, "propose new command at index", index, "command", command)
     }
 	return index, term, isLeader
 }
@@ -1207,8 +1321,6 @@ func (rf *Raft) Kill() {
         log.Println(rf.me, ": stop.")
         rf.role.Stop()
     }
-    time.Sleep(time.Millisecond * time.Duration(32))
-    rf.persist()
     close(rf.queue)
 }
 
@@ -1242,7 +1354,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.queue = make(chan *RaftOperation, 1)
 
 	// Initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	// rf.readPersist(persister.ReadRaftState())
+    rf.store.ReadPersist(persister.ReadRaftState())
 
     // Start this peer
     rf.run()
