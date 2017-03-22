@@ -406,8 +406,8 @@ func (repl *LogReplicator) ReplicateLogs() {
             } else {
                 // previous log doesn't match, replicate backward
                 repl.DecrementReplIndex()
-                log.Println(repl.leader.rf.me, "replicator", repl.peer,
-                            "decrement repl index to", repl.GetReplIndex())
+                // log.Println(repl.leader.rf.me, "replicator", repl.peer,
+                //             "decrement repl index to", repl.GetReplIndex())
                 _, repl.prevLog = repl.leader.rf.store.Read(repl.GetReplIndex())
             }
         }

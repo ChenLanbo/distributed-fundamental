@@ -2,10 +2,11 @@ package raftkv
 
 import (
 	"encoding/gob"
-	"labrpc"
 	"log"
-	"raft"
 	"sync"
+
+	"labrpc"
+	"raft"
 )
 
 const Debug = 0
@@ -17,11 +18,19 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OpType int
+const (
+    GETOP OpType = iota + 1
+    PUTAPPENDOP
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+    Type OpType
+    GetRequest *GetArgs
+    PutAppendRequest *PutAppendArgs
 }
 
 type RaftKV struct {
@@ -38,10 +47,30 @@ type RaftKV struct {
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+    op := &Op{}
+    op.Type = GETOP
+    op.GetRequest = args
+    op.PutAppendRequest = nil
+
+    index, term, isLeader := kv.rf.Start(op)
+    if !isLeader {
+        reply.WrongLeader = true
+        return
+    }
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+    op := &Op{}
+    op.Type = PUTAPPENDOP
+    op.GetRequest = nil
+    op.PutAppendRequest = args
+
+    index, term, isLeader := kv.rf.Start(op)
+    if !isLeader {
+        reply.WrongLeader = true
+        return
+    }
 }
 
 //

@@ -1,27 +1,48 @@
 package raftkv
 
-import "labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+    "math/rand"
+    "sync"
+
+    "labrpc"
+)
 
 
 type Clerk struct {
-	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+    servers []*labrpc.ClientEnd
+    // You will have to modify this struct.
+    mu sync.Mutex
+    leader int
 }
 
-func nrand() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
-	x := bigx.Int64()
-	return x
-}
+// func nrand() int64 {
+//     max := big.NewInt(int64(1) << 62)
+//     bigx, _ := rand.Int(rand.Reader, max)
+//     x := bigx.Int64()
+//     return x
+// }
 
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
-	ck := new(Clerk)
-	ck.servers = servers
-	// You'll have to add code here.
-	return ck
+    ck := new(Clerk)
+    ck.servers = servers
+    ck.leader = -1
+    // You'll have to add code here.
+    return ck
+}
+
+func (ck *Clerk) setLeader(leader int) {
+    ck.mu.Lock()
+    defer ck.mu.Unlock()
+    ck.leader = leader
+}
+
+func (ck *Clerk) getLeader() int {
+    ck.mu.Lock()
+    defer ck.mu.Unlock()
+    if ck.leader == -1 {
+        return rand.Intn(len(ck.servers))
+    }
+    return ck.leader
 }
 
 //
@@ -37,9 +58,30 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+    // You will have to modify this function.
 
-	// You will have to modify this function.
-	return ""
+    for {
+        server := ck.getLeader()
+
+        request := &GetArgs{Key:key}
+        reply := &GetReply{}
+
+        ok := ck.servers[server].Call("RaftKV.Get", request, reply)
+        if ok {
+            if !reply.WrongLeader {
+                ck.setLeader(server)
+                if reply.Err == OK {
+                    return reply.Value
+                } else {
+                    // log error
+                }
+            } else {
+                ck.setLeader(-1)
+            }
+        }
+    }
+
+    return ""
 }
 
 //
@@ -53,12 +95,29 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+    // You will have to modify this function.
+    for {
+        server := ck.getLeader()
+
+        request := &PutAppendArgs{Key:key, Value:value, Op:op}
+        reply := &PutAppendReply{}
+
+        ok := ck.servers[server].Call("RaftKV.PutAppend", request, reply)
+        if ok {
+            if !reply.WrongLeader {
+                if reply.Err == OK {
+                    return
+                }
+            } else {
+                ck.setLeader(-1)
+            }
+        }
+    }
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+    ck.PutAppend(key, value, "Put")
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+    ck.PutAppend(key, value, "Append")
 }
