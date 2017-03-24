@@ -111,6 +111,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
         ok := ck.servers[server].Call("RaftKV.PutAppend", request, reply)
         if ok {
             if !reply.WrongLeader {
+                ck.setLeader(server)
                 if reply.Err == OK {
                     return
                 }

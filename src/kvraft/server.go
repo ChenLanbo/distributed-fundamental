@@ -4,6 +4,8 @@ import (
 	"encoding/gob"
 	"log"
 	"sync"
+	"sync/atomic"
+    "time"
 
 	"labrpc"
 	"raft"
@@ -18,6 +20,9 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+//
+// Index storage of RaftKV
+//
 type KVIndexCell struct {
     Timestamp int64
     RequestId int64
@@ -52,14 +57,52 @@ func (index *KVIndex) Get(request *GetArgs) string {
     index.mu.Lock()
     defer index.mu.Unlock()
 
-    cells, prs := index.mp[request.Key]
+    value := ""
+    row, prs := index.mp[request.Key]
     if !prs {
         return ""
     }
 
+    for _, cell := range(row) {
+        if cell.Op == "Put" {
+            value = cell.Value
+        } else if cell.Op == "Append" {
+            value += cell.Value
+        }
+    }
+
+    return value
 }
 
-func (index *KVIndex) PutAppend(request *PutAppendArgs) string {
+func (index *KVIndex) PutAppend(request *PutAppendArgs) {
+    index.mu.Lock()
+    defer index.mu.Unlock()
+
+    _, prs := index.mp[request.Key]
+    if !prs {
+        cell := KVIndexCell{
+            Timestamp:request.Timestamp,
+            RequestId:request.RequestId,
+            Value:request.Value,
+            Op:request.Op}
+
+        index.mp[request.Key] = make([]KVIndexCell, 0)
+        index.mp[request.Key] = append(index.mp[request.Key], cell)
+        return
+    }
+
+    for _, cell := range(index.mp[request.Key]) {
+        if cell.Timestamp == request.Timestamp && cell.RequestId == request.RequestId {
+            return
+        }
+    }
+    cell := KVIndexCell{
+        Timestamp:request.Timestamp,
+        RequestId:request.RequestId,
+        Value:request.Value,
+        Op:request.Op}
+    index.mp[request.Key] = append(index.mp[request.Key], cell)
+    sort.Sort(KVIndexRow(index.mp[request.Key])
 }
 
 type OpType int
@@ -77,6 +120,23 @@ type Op struct {
     PutAppendRequest *PutAppendArgs
 }
 
+type OpCallback struct {
+    op *Op
+    lookupChan chan GetReply
+    mutateChan chan PutAppendReply
+}
+
+func MakeOpCallback(op *Op) *OpCallback {
+    cb := &OpCallback{}
+    cb.op = op
+    cb.lookupChan = make(chan GetReply, 1)
+    cb.mutateChan = make(chan PutAppendReply, 1)
+    return cb
+}
+
+//
+// RaftKV server
+//
 type RaftKV struct {
 	mu      sync.Mutex
 	me      int
@@ -86,8 +146,61 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+    stop int
+    index KVIndex
+    callbacks map[int64]*OpCallback
 }
 
+func (kv *RaftKV) AddCallback(seq int, cb *OpCallback) {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+
+    kv.callbacks[seq] = cb
+}
+
+func (kv *RaftKV) InvokeCallback(seq int, op *Op) {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+
+    _, prs := kv.callbacks[seq]
+    if !prs {
+        return
+    }
+
+    if kv.callbacks[seq].op.Type == GETOP {
+        if op.Type == GETOP {
+        } else if op.Type == PUTAPPENDOP {
+            reply := GetReply{WrongLeader:false, Err:""}
+            kv.callbacks[seq].lookupChan <-
+        }
+    } else if kv.callbacks[seq].op.Type == PUTAPPENDOP {
+        if op.Type == GETOP {
+        } else if op.Type == PUTAPPENDOP {
+        }
+    }
+}
+
+
+func (kv *RaftKV) ApplyLogs() {
+    go func() {
+        for !kv.Killed() {
+            select {
+            case msg := <- kv.applyCh:
+                //
+                op := msg.Command.(*Op)
+                if op.Type == GETOP {
+                    value := kv.index.Get(op.GetRequest)
+                    reply := GetReply{WrongLeader:false, Err:OK, Value:value}
+                } else if op.Type == PUTAPPENDOP {
+                    kv.index.PutAppend(op.PutAppendRequest)
+                    reply := PutAppendReply{WrongLeader:false, Err:OK}
+                }
+            case <- time.After(time.Second):
+                // Noop
+            }
+        }
+    } ()
+}
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
@@ -96,11 +209,19 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
     op.GetRequest = args
     op.PutAppendRequest = nil
 
-    index, term, isLeader := kv.rf.Start(op)
+    seq, term, isLeader := kv.rf.Start(op)
     if !isLeader {
         reply.WrongLeader = true
         return
     }
+
+    cb := MakeOpCallback(op)
+    defer close(cb.lookupChan)
+    defer close(cb.mutateChan)
+    kv.AddCallback(seq, cb)
+
+    r := <- cb.lookupChan
+    *reply = r
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -115,6 +236,14 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
         reply.WrongLeader = true
         return
     }
+
+    cb := MakeOpCallback(op)
+    defer close(cb.lookupChan)
+    defer close(cb.mutateChan)
+    kv.AddCallback(seq, cb)
+
+    r := <- cb.mutateChan
+    *reply = r
 }
 
 //
@@ -126,6 +255,11 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *RaftKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+    atomic.StoreInt32(&kv.stop, 1)
+}
+
+func (kv *RaftKV) Killed() bool {
+    return atomic.LoadInt32(&kv.stop) == 1
 }
 
 //
