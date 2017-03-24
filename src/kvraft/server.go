@@ -18,6 +18,50 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type KVIndexCell struct {
+    Timestamp int64
+    RequestId int64
+    Value string
+    Op string
+}
+
+type KVIndexRow []KVIndexCell
+
+func (r KVIndexRow) Len() int {
+    return len(r)
+}
+
+func (r KVIndexRow) Swap(i, j) {
+    r[i], r[j] = r[j], r[i]
+}
+
+func (r KVIndexRow) Less(i, j int) bool {
+    if r[i].Timestamp != r[j].Timestamp {
+        return r[i].Timestamp < r[j].Timestamp
+    }
+
+    return r[i].RequestId < r[j].RequestId
+}
+
+type KVIndex struct {
+	mu      sync.Mutex
+    mp map[string][]KVIndexCell
+}
+
+func (index *KVIndex) Get(request *GetArgs) string {
+    index.mu.Lock()
+    defer index.mu.Unlock()
+
+    cells, prs := index.mp[request.Key]
+    if !prs {
+        return ""
+    }
+
+}
+
+func (index *KVIndex) PutAppend(request *PutAppendArgs) string {
+}
+
 type OpType int
 const (
     GETOP OpType = iota + 1
