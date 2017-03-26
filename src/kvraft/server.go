@@ -3,6 +3,7 @@ package raftkv
 import (
 	"encoding/gob"
 	"log"
+    "sort"
 	"sync"
 	"sync/atomic"
     "time"
@@ -36,7 +37,7 @@ func (r KVIndexRow) Len() int {
     return len(r)
 }
 
-func (r KVIndexRow) Swap(i, j) {
+func (r KVIndexRow) Swap(i, j int) {
     r[i], r[j] = r[j], r[i]
 }
 
@@ -51,6 +52,12 @@ func (r KVIndexRow) Less(i, j int) bool {
 type KVIndex struct {
 	mu      sync.Mutex
     mp map[string][]KVIndexCell
+}
+
+func MakeKVIndex() *KVIndex {
+    index :=  &KVIndex{}
+    index.mp = make(map[string][]KVIndexCell)
+    return index
 }
 
 func (index *KVIndex) Get(request *GetArgs) string {
@@ -102,7 +109,7 @@ func (index *KVIndex) PutAppend(request *PutAppendArgs) {
         Value:request.Value,
         Op:request.Op}
     index.mp[request.Key] = append(index.mp[request.Key], cell)
-    sort.Sort(KVIndexRow(index.mp[request.Key])
+    sort.Sort(KVIndexRow(index.mp[request.Key]))
 }
 
 type OpType int
@@ -146,9 +153,9 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-    stop int
-    index KVIndex
-    callbacks map[int64]*OpCallback
+    stop int32
+    index *KVIndex
+    callbacks map[int]*OpCallback
 }
 
 func (kv *RaftKV) AddCallback(seq int, cb *OpCallback) {
@@ -158,9 +165,23 @@ func (kv *RaftKV) AddCallback(seq int, cb *OpCallback) {
     kv.callbacks[seq] = cb
 }
 
+func (kv *RaftKV) DelCallback(seq int) {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+
+    delete(kv.callbacks, seq)
+}
+
 func (kv *RaftKV) InvokeCallback(seq int, op *Op) {
     kv.mu.Lock()
     defer kv.mu.Unlock()
+
+    var value string = ""
+    if op.Type == GETOP {
+        value = kv.index.Get(op.GetRequest)
+    } else if op.Type == PUTAPPENDOP {
+        kv.index.PutAppend(op.PutAppendRequest)
+    }
 
     _, prs := kv.callbacks[seq]
     if !prs {
@@ -168,15 +189,33 @@ func (kv *RaftKV) InvokeCallback(seq int, op *Op) {
     }
 
     if kv.callbacks[seq].op.Type == GETOP {
+        var reply GetReply
+
         if op.Type == GETOP {
+            if kv.callbacks[seq].op.GetRequest.RequestId == op.GetRequest.RequestId && kv.callbacks[seq].op.GetRequest.Timestamp == op.GetRequest.Timestamp {
+                reply = GetReply{WrongLeader:false, Err:OK, Value:value}
+            } else {
+                reply = GetReply{WrongLeader:true, Err:ErrLeaderSwitch, Value:value}
+            }
         } else if op.Type == PUTAPPENDOP {
-            reply := GetReply{WrongLeader:false, Err:""}
-            kv.callbacks[seq].lookupChan <-
+            reply = GetReply{WrongLeader:true, Err:ErrLeaderSwitch, Value:value}
         }
+
+        kv.callbacks[seq].lookupChan <- reply
     } else if kv.callbacks[seq].op.Type == PUTAPPENDOP {
+        var reply PutAppendReply
+
         if op.Type == GETOP {
+            reply = PutAppendReply{WrongLeader:true, Err:ErrLeaderSwitch}
         } else if op.Type == PUTAPPENDOP {
+            if kv.callbacks[seq].op.PutAppendRequest.RequestId == op.PutAppendRequest.RequestId && kv.callbacks[seq].op.PutAppendRequest.Timestamp == op.PutAppendRequest.Timestamp {
+                reply = PutAppendReply{WrongLeader:false, Err:OK}
+            } else {
+                reply = PutAppendReply{WrongLeader:true, Err:ErrLeaderSwitch}
+            }
         }
+
+        kv.callbacks[seq].mutateChan <- reply
     }
 }
 
@@ -186,15 +225,15 @@ func (kv *RaftKV) ApplyLogs() {
         for !kv.Killed() {
             select {
             case msg := <- kv.applyCh:
-                //
-                op := msg.Command.(*Op)
-                if op.Type == GETOP {
-                    value := kv.index.Get(op.GetRequest)
-                    reply := GetReply{WrongLeader:false, Err:OK, Value:value}
+                op := msg.Command.(Op)
+                kv.InvokeCallback(msg.Index, &op)
+                /* if op.Type == GETOP {
+                    // value := kv.index.Get(op.GetRequest)
+                    // reply := GetReply{WrongLeader:false, Err:OK, Value:value}
                 } else if op.Type == PUTAPPENDOP {
-                    kv.index.PutAppend(op.PutAppendRequest)
+                    // kv.index.PutAppend(op.PutAppendRequest)
                     reply := PutAppendReply{WrongLeader:false, Err:OK}
-                }
+                } */
             case <- time.After(time.Second):
                 // Noop
             }
@@ -209,7 +248,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
     op.GetRequest = args
     op.PutAppendRequest = nil
 
-    seq, term, isLeader := kv.rf.Start(op)
+    seq, _, isLeader := kv.rf.Start(op)
     if !isLeader {
         reply.WrongLeader = true
         return
@@ -222,6 +261,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
     r := <- cb.lookupChan
     *reply = r
+    kv.DelCallback(seq)
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -231,7 +271,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
     op.GetRequest = nil
     op.PutAppendRequest = args
 
-    index, term, isLeader := kv.rf.Start(op)
+    seq, _, isLeader := kv.rf.Start(op)
     if !isLeader {
         reply.WrongLeader = true
         return
@@ -244,6 +284,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
     r := <- cb.mutateChan
     *reply = r
+    kv.DelCallback(seq)
 }
 
 //
@@ -290,6 +331,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+    kv.stop = 0
+    kv.index = MakeKVIndex()
+    kv.callbacks = make(map[int]*OpCallback)
+    kv.ApplyLogs()
 
 	return kv
 }

@@ -105,7 +105,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
         request := &PutAppendArgs{
             Key:key, Value:value, Op:op,
-            RequestId:nrand(), Timestamp:Timestamp:time.Now().UnixNano()}
+            RequestId:nrand(), Timestamp:time.Now().UnixNano()}
         reply := &PutAppendReply{}
 
         ok := ck.servers[server].Call("RaftKV.PutAppend", request, reply)
