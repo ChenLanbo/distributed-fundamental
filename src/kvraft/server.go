@@ -88,7 +88,7 @@ func (index *KVIndex) PutAppend(request *PutAppendArgs) {
     _, prs := index.mp[request.Key]
     if !prs {
         cell := KVIndexCell{
-            Timestamp:request.Timestamp,
+            Timestamp:time.Now().UnixNano(),
             RequestId:request.RequestId,
             Value:request.Value,
             Op:request.Op}
@@ -99,12 +99,13 @@ func (index *KVIndex) PutAppend(request *PutAppendArgs) {
     }
 
     for _, cell := range(index.mp[request.Key]) {
-        if cell.Timestamp == request.Timestamp && cell.RequestId == request.RequestId {
+        if cell.RequestId == request.RequestId {
             return
         }
     }
+
     cell := KVIndexCell{
-        Timestamp:request.Timestamp,
+        Timestamp:time.Now().UnixNano(),
         RequestId:request.RequestId,
         Value:request.Value,
         Op:request.Op}
@@ -219,21 +220,29 @@ func (kv *RaftKV) InvokeCallback(seq int, op *Op) {
     }
 }
 
+func (kv *RaftKV) CleanupCallbacks() {
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+    for _, cb := range(kv.callbacks) {
+        if cb.op.Type == GETOP {
+            cb.lookupChan <- GetReply{WrongLeader:true, Err:ErrLeaderSwitch, Value:""}
+        } else if cb.op.Type == PUTAPPENDOP {
+            cb.mutateChan <- PutAppendReply{WrongLeader:true, Err:ErrLeaderSwitch}
+        }
+    }
+}
 
 func (kv *RaftKV) ApplyLogs() {
     go func() {
         for !kv.Killed() {
             select {
             case msg := <- kv.applyCh:
+                if msg.Command == nil {
+                    log.Println(kv.me, "WARNING: got NIL command!!!")
+                    continue
+                }
                 op := msg.Command.(Op)
                 kv.InvokeCallback(msg.Index, &op)
-                /* if op.Type == GETOP {
-                    // value := kv.index.Get(op.GetRequest)
-                    // reply := GetReply{WrongLeader:false, Err:OK, Value:value}
-                } else if op.Type == PUTAPPENDOP {
-                    // kv.index.PutAppend(op.PutAppendRequest)
-                    reply := PutAppendReply{WrongLeader:false, Err:OK}
-                } */
             case <- time.After(time.Second):
                 // Noop
             }
@@ -243,7 +252,7 @@ func (kv *RaftKV) ApplyLogs() {
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-    op := &Op{}
+    op := Op{}
     op.Type = GETOP
     op.GetRequest = args
     op.PutAppendRequest = nil
@@ -254,7 +263,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
         return
     }
 
-    cb := MakeOpCallback(op)
+    cb := MakeOpCallback(&op)
     defer close(cb.lookupChan)
     defer close(cb.mutateChan)
     kv.AddCallback(seq, cb)
@@ -266,7 +275,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-    op := &Op{}
+    op := Op{}
     op.Type = PUTAPPENDOP
     op.GetRequest = nil
     op.PutAppendRequest = args
@@ -277,7 +286,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
         return
     }
 
-    cb := MakeOpCallback(op)
+    cb := MakeOpCallback(&op)
     defer close(cb.lookupChan)
     defer close(cb.mutateChan)
     kv.AddCallback(seq, cb)
@@ -297,6 +306,7 @@ func (kv *RaftKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
     atomic.StoreInt32(&kv.stop, 1)
+    kv.CleanupCallbacks()
 }
 
 func (kv *RaftKV) Killed() bool {

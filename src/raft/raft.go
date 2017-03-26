@@ -231,6 +231,8 @@ func (leader *RaftLeader) Run() {
     leader.rf.roleMu.Lock()
     defer leader.rf.roleMu.Unlock()
 
+    leader.rf.store.Propose(nil)
+
     if leader.rf.state != LEADER {
         // Log error
         log.Println(leader.rf.me, ": not in leader state.")
@@ -444,7 +446,7 @@ func (committer *LogCommitter) CommitLogs() {
             // Only commit logs at current term
             success, l := committer.leader.rf.store.Read(replProgress[mid])
             if success && l.Term == committer.leader.rf.store.GetTerm() {
-                log.Println(committer.leader.rf.me, ": advance commit index to", replProgress[mid])
+                // log.Println(committer.leader.rf.me, ": advance commit index to", replProgress[mid])
                 committer.leader.rf.store.SetCommitIndex(replProgress[mid])
             }
         } else {
@@ -964,6 +966,9 @@ func (s *Store) Propose(command interface{}) (int, int, bool) {
 
         // log.Println(s.rf.me, "leader proposing log with index", newLog.Index,
         //             "term", newLog.Term, "command", newLog.Command)
+        if command == nil {
+            log.Println(s.rf.me, "PROPOSE nil command ------------------- at index", nextLogIndex)
+        }
     }
 
     return nextLogIndex, nextLogTerm, isLeader
@@ -987,22 +992,11 @@ func (s *Store) Append(newLogs []Log) {
         s.logs = append(s.logs, newLog)
         // log.Println(s.rf.me, "adding log with index", newLog.Index,
         //             "term", newLog.Term, "command", newLog.Command, "len", len(newLogs))
+        /* if newLog.Command == nil {
+            log.Println(s.rf.me, "APPEND WARNING: nil command at index", newLog.Index)
+        } */
         s.Persist(newLog)
     }
-
-    /* if s.commitIndex > logs[0].Index {
-        panic("Commit index is greater than log index.")
-    }
-
-    latest := len(s.logs) - 1
-    if s.logs[latest].Index >= logs[0].Index {
-        s.logs = s.logs[:logs[0].Index]
-    }
-
-    for _, log := range(logs) {
-        s.logs = append(s.logs, log)
-        s.Persist(log)
-    } */
 }
 
 //
@@ -1040,6 +1034,10 @@ func (s *Store) ApplyLogs(applyTo int) {
         applyMsg.Snapshot = make([]byte, 0)
         s.applyChan <- applyMsg
         s.applyIndex++
+
+        if applyMsg.Command == nil {
+            log.Println(s.rf.me, "+++ Command is NIL at index", s.applyIndex, applyTo, len(s.logs))
+        }
         // log.Println(s.rf.me,
         //             "apply log with index", s.applyIndex,
         //             "command", applyMsg.Command,
@@ -1064,6 +1062,10 @@ func (s *Store) Persist(l Log) {
     e.Encode(l.Index)
     // Using & will correct encode the Command
     e.Encode(&l.Command)
+    if l.Command == nil {
+        log.Println(s.rf.me, "PERSIST BAD: *** NIL COMMAND AT TERM",
+                    l.Term, "INDEX", l.Index)
+    }
 
     // log.Println(s.rf.me, "persist raft state len:", s.raftState.Len(),
     //             "command", l.Term, l.Index, l.Command)
@@ -1094,6 +1096,9 @@ func (s *Store) ReadPersist(data []byte) {
         d.Decode(&l.Term)
         d.Decode(&l.Index)
         d.Decode(&l.Command)
+        if l.Command == nil {
+            log.Println(s.rf.me, "RECOVER BAD: GOT NIL COMMAND AT TERM", l.Term, "INDEX", l.Index)
+        }
         if l.Index < len(s.logs) {
             s.logs[l.Index] = l
         } else {

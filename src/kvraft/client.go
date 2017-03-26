@@ -62,16 +62,43 @@ func (ck *Clerk) getLeader() int {
 //
 func (ck *Clerk) Get(key string) string {
     // You will have to modify this function.
+    rid := nrand()
+    valueChan := make(chan string, 1)
+    defer close(valueChan)
 
     for {
         server := ck.getLeader()
 
-        request := &GetArgs{
-            Key:key, RequestId:nrand(), Timestamp:time.Now().UnixNano()}
-        reply := &GetReply{}
+        go func(server int) {
+            defer func() {
+                if r := recover(); r != nil {
+                }
+            } ()
 
-        ok := ck.servers[server].Call("RaftKV.Get", request, reply)
-        if ok {
+            request := &GetArgs{
+                Key:key, RequestId:rid, Timestamp:time.Now().UnixNano()}
+            reply := &GetReply{}
+            ok := ck.servers[server].Call("RaftKV.Get", request, reply)
+
+            if ok {
+                if !reply.WrongLeader {
+                    if reply.Err == OK {
+                        valueChan <- reply.Value
+                    }
+                }
+            }
+        } (server)
+
+        select {
+        case value := <- valueChan:
+            ck.setLeader(server)
+            return value
+        case <- time.After(time.Second):
+            // Timeout
+        }
+        ck.setLeader(-1)
+
+        /* if ok {
             if !reply.WrongLeader {
                 ck.setLeader(server)
                 if reply.Err == OK {
@@ -82,7 +109,7 @@ func (ck *Clerk) Get(key string) string {
             } else {
                 ck.setLeader(-1)
             }
-        }
+        } */
     }
 
     return ""
@@ -99,17 +126,46 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+    rid := nrand()
+    successChan := make(chan bool, 1)
+    defer close(successChan)
     // You will have to modify this function.
+
     for {
         server := ck.getLeader()
 
-        request := &PutAppendArgs{
-            Key:key, Value:value, Op:op,
-            RequestId:nrand(), Timestamp:time.Now().UnixNano()}
-        reply := &PutAppendReply{}
+        go func(server int) {
+            defer func() {
+                if r := recover(); r != nil {
+                }
+            } ()
+            request := &PutAppendArgs{
+                Key:key, Value:value, Op:op,
+                RequestId:rid, Timestamp:time.Now().UnixNano()}
+            reply := &PutAppendReply{}
+            ok := ck.servers[server].Call("RaftKV.PutAppend", request, reply)
 
-        ok := ck.servers[server].Call("RaftKV.PutAppend", request, reply)
-        if ok {
+            if ok {
+                if !reply.WrongLeader {
+                    if reply.Err == OK {
+                        successChan <- true
+                    }
+                }
+            }
+        } (server)
+
+        select {
+        case success := <- successChan:
+            if success {
+                ck.setLeader(server)
+                return
+            }
+        case <- time.After(time.Second):
+            // Timeout
+        }
+        ck.setLeader(-1)
+
+        /* if ok {
             if !reply.WrongLeader {
                 ck.setLeader(server)
                 if reply.Err == OK {
@@ -118,7 +174,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
             } else {
                 ck.setLeader(-1)
             }
-        }
+        } */
     }
 }
 
