@@ -16,8 +16,8 @@ type PutAppendArgs struct {
     // You'll have to add definitions here.
     // Field names must start with capital letters,
     // otherwise RPC will break.
-    Timestamp int64
     RequestId int64
+    Timestamp int64
 }
 
 type PutAppendReply struct {

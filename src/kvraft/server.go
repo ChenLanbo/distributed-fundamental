@@ -28,7 +28,7 @@ type KVIndexCell struct {
     Timestamp int64
     RequestId int64
     Value string
-    Op string
+    ValueOp string
 }
 
 type KVIndexRow []KVIndexCell
@@ -60,20 +60,23 @@ func MakeKVIndex() *KVIndex {
     return index
 }
 
-func (index *KVIndex) Get(request *GetArgs) string {
+func (index *KVIndex) Get(op *Op) string {
     index.mu.Lock()
     defer index.mu.Unlock()
+    if op.Type != GETOP {
+        return ""
+    }
 
     value := ""
-    row, prs := index.mp[request.Key]
+    row, prs := index.mp[op.Key]
     if !prs {
         return ""
     }
 
     for _, cell := range(row) {
-        if cell.Op == "Put" {
+        if cell.ValueOp == "Put" {
             value = cell.Value
-        } else if cell.Op == "Append" {
+        } else if cell.ValueOp == "Append" {
             value += cell.Value
         }
     }
@@ -81,51 +84,56 @@ func (index *KVIndex) Get(request *GetArgs) string {
     return value
 }
 
-func (index *KVIndex) PutAppend(request *PutAppendArgs) {
+func (index *KVIndex) PutAppend(op *Op) {
     index.mu.Lock()
     defer index.mu.Unlock()
-
-    _, prs := index.mp[request.Key]
-    if !prs {
-        cell := KVIndexCell{
-            Timestamp:time.Now().UnixNano(),
-            RequestId:request.RequestId,
-            Value:request.Value,
-            Op:request.Op}
-
-        index.mp[request.Key] = make([]KVIndexCell, 0)
-        index.mp[request.Key] = append(index.mp[request.Key], cell)
+    if op.Type != PUTAPPENDOP {
         return
     }
 
-    for _, cell := range(index.mp[request.Key]) {
-        if cell.RequestId == request.RequestId {
+    _, prs := index.mp[op.Key]
+    if !prs {
+        cell := KVIndexCell{
+            Timestamp:time.Now().UnixNano(),
+            RequestId:op.RequestId,
+            Value:op.Value,
+            ValueOp:op.ValueOp}
+
+        index.mp[op.Key] = make([]KVIndexCell, 0)
+        index.mp[op.Key] = append(index.mp[op.Key], cell)
+        return
+    }
+
+    for _, cell := range(index.mp[op.Key]) {
+        if cell.RequestId == op.RequestId {
             return
         }
     }
 
     cell := KVIndexCell{
         Timestamp:time.Now().UnixNano(),
-        RequestId:request.RequestId,
-        Value:request.Value,
-        Op:request.Op}
-    index.mp[request.Key] = append(index.mp[request.Key], cell)
-    sort.Sort(KVIndexRow(index.mp[request.Key]))
+        RequestId:op.RequestId,
+        Value:op.Value,
+        ValueOp:op.ValueOp}
+    index.mp[op.Key] = append(index.mp[op.Key], cell)
+    sort.Sort(KVIndexRow(index.mp[op.Key]))
 }
 
-type OpType int
 const (
-    GETOP OpType = iota + 1
-    PUTAPPENDOP
+    GETOP = 1
+    PUTAPPENDOP = 2
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-    Type OpType
-    GetRequest *GetArgs
-    PutAppendRequest *PutAppendArgs
+    Type int
+    Key string
+    Value string
+    ValueOp string
+    RequestId int64
+    Timestamp int64
 }
 
 type OpCallback struct {
@@ -179,9 +187,9 @@ func (kv *RaftKV) InvokeCallback(seq int, op *Op) {
 
     var value string = ""
     if op.Type == GETOP {
-        value = kv.index.Get(op.GetRequest)
+        value = kv.index.Get(op)
     } else if op.Type == PUTAPPENDOP {
-        kv.index.PutAppend(op.PutAppendRequest)
+        kv.index.PutAppend(op)
     }
 
     _, prs := kv.callbacks[seq]
@@ -193,7 +201,7 @@ func (kv *RaftKV) InvokeCallback(seq int, op *Op) {
         var reply GetReply
 
         if op.Type == GETOP {
-            if kv.callbacks[seq].op.GetRequest.RequestId == op.GetRequest.RequestId && kv.callbacks[seq].op.GetRequest.Timestamp == op.GetRequest.Timestamp {
+            if kv.callbacks[seq].op.RequestId == op.RequestId && kv.callbacks[seq].op.Timestamp == op.Timestamp {
                 reply = GetReply{WrongLeader:false, Err:OK, Value:value}
             } else {
                 reply = GetReply{WrongLeader:true, Err:ErrLeaderSwitch, Value:value}
@@ -209,7 +217,7 @@ func (kv *RaftKV) InvokeCallback(seq int, op *Op) {
         if op.Type == GETOP {
             reply = PutAppendReply{WrongLeader:true, Err:ErrLeaderSwitch}
         } else if op.Type == PUTAPPENDOP {
-            if kv.callbacks[seq].op.PutAppendRequest.RequestId == op.PutAppendRequest.RequestId && kv.callbacks[seq].op.PutAppendRequest.Timestamp == op.PutAppendRequest.Timestamp {
+            if kv.callbacks[seq].op.RequestId == op.RequestId && kv.callbacks[seq].op.Timestamp == op.Timestamp {
                 reply = PutAppendReply{WrongLeader:false, Err:OK}
             } else {
                 reply = PutAppendReply{WrongLeader:true, Err:ErrLeaderSwitch}
@@ -254,8 +262,11 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
     op := Op{}
     op.Type = GETOP
-    op.GetRequest = args
-    op.PutAppendRequest = nil
+    op.Key = args.Key
+    op.RequestId = args.RequestId
+    op.Timestamp = args.Timestamp
+    // op.GetRequest = args
+    // op.PutAppendRequest = nil
 
     seq, _, isLeader := kv.rf.Start(op)
     if !isLeader {
@@ -277,8 +288,13 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
     op := Op{}
     op.Type = PUTAPPENDOP
-    op.GetRequest = nil
-    op.PutAppendRequest = args
+    op.Key = args.Key
+    op.Value = args.Value
+    op.ValueOp = args.Op
+    op.RequestId = args.RequestId
+    op.Timestamp = args.Timestamp
+    // op.GetRequest = nil
+    // op.PutAppendRequest = args
 
     seq, _, isLeader := kv.rf.Start(op)
     if !isLeader {

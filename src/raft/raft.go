@@ -31,10 +31,15 @@ import (
     "labrpc"
 )
 
-// import "bytes"
-// import "encoding/gob"
-
-
+//
+// Debug logging
+//
+const debugLevel = 1
+func dLog(a ...interface{}) {
+    if debugLevel > 0 {
+        log.Println(a...)
+    }
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -82,29 +87,28 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-
     e.Encode(rf.store.currentTerm)
     e.Encode(rf.store.votedFor)
     e.Encode(rf.store.commitIndex)
-    e.Encode(rf.store.applyIndex)
-
     e.Encode(len(rf.store.logs) - 1)
-    for i, log := range(rf.store.logs) {
+
+    for i, ll := range(rf.store.logs) {
         if i == 0 {
             continue
         }
-        e.Encode(log.Term)
-        e.Encode(log.Index)
-        e.Encode(log.Command)
+        e.Encode(ll.Term)
+        e.Encode(ll.Index)
+    }
+    for i, ll := range(rf.store.logs) {
+        if i == 0 {
+            continue
+        }
+        e.Encode(&ll.Command)
     }
 	data := w.Bytes()
-    log.Println(rf.me, "save states at term", rf.store.currentTerm, "BYTES", len(data))
+
 	rf.persister.SaveRaftState(data)
 }
 
@@ -114,9 +118,6 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here (2C).
 	// Example:
-    rf.store.mu.Lock()
-    defer rf.store.mu.Unlock()
-    log.Println(rf.me, "recover data", len(data))
     var numLogs int
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -126,18 +127,24 @@ func (rf *Raft) readPersist(data []byte) {
     d.Decode(&rf.store.currentTerm)
     d.Decode(&rf.store.votedFor)
     d.Decode(&rf.store.commitIndex)
-    d.Decode(&rf.store.applyIndex)
 
     d.Decode(&numLogs)
     for i := 0; i < numLogs; i++ {
         var l Log
         d.Decode(&l.Term)
         d.Decode(&l.Index)
-        d.Decode(&l.Command)
         rf.store.logs = append(rf.store.logs, l)
     }
 
-    log.Println(rf.me, "my starting term", rf.store.currentTerm)
+    for i := 0; i < numLogs; i++ {
+        if err := d.Decode(&(rf.store.logs[i + 1].Command)); err != nil {
+            log.Println(rf.me, "DECODE ERROR LOG COMMAND:", err)
+        }
+    }
+
+    go func() {
+        rf.store.ApplyLogs(rf.store.commitIndex)
+    } ()
 }
 
 func (rf *Raft) setState(state RaftState) {
@@ -164,13 +171,13 @@ func (rf *Raft) run() {
         for !rf.Killed() {
             switch rf.state {
             case LEADER:
-                log.Println(rf.me, ": run as a leader at term", rf.store.GetTerm())
+                dLog(rf.me, ": run as a leader at term", rf.store.GetTerm())
                 rf.role = MakeLeader(rf)
             case CANDIDATE:
-                log.Println(rf.me, ": run as a candidate.")
+                dLog(rf.me, ": run as a candidate.")
                 rf.role = MakeCandidate(rf)
             case FOLLOWER:
-                log.Println(rf.me, ": run as a follower.")
+                dLog(rf.me, ": run as a follower.")
                 rf.role = MakeFollower(rf)
             }
             rf.role.Run()
@@ -231,11 +238,9 @@ func (leader *RaftLeader) Run() {
     leader.rf.roleMu.Lock()
     defer leader.rf.roleMu.Unlock()
 
-    leader.rf.store.Propose(nil)
-
     if leader.rf.state != LEADER {
         // Log error
-        log.Println(leader.rf.me, ": not in leader state.")
+        dLog(leader.rf.me, ": not in leader state.")
         return
     }
 
@@ -281,7 +286,7 @@ func (leader *RaftLeader) Stopped() bool {
 }
 
 func (leader *RaftLeader) ProcessRequests() {
-    log.Println(leader.rf.me, ": start processing requests")
+    dLog(leader.rf.me, ": start processing requests")
     for !leader.Stopped() {
         op := <- leader.rf.queue
 
@@ -290,7 +295,8 @@ func (leader *RaftLeader) ProcessRequests() {
         }
 
         if op.VoteRequest != nil {
-            log.Println(leader.rf.me, "get vote request from", op.VoteRequest.CandidateId)
+            dLog(leader.rf.me, "get vote request from", op.VoteRequest.CandidateId)
+
             reply := RequestVoteReply{VoteGranted:false, Term:leader.rf.store.GetTerm()}
             op.VoteCallback <- reply
 
@@ -300,7 +306,8 @@ func (leader *RaftLeader) ProcessRequests() {
                 return
             }
         } else if op.AppendRequest != nil {
-            log.Println(leader.rf.me, "get append request from", op.AppendRequest.LeaderId)
+            dLog(leader.rf.me, "get append request from", op.AppendRequest.LeaderId)
+
             reply := AppendEntriesReply{Term:leader.rf.store.GetTerm(), Success:false}
             op.AppendCallback <- reply
 
@@ -357,9 +364,10 @@ func (repl *LogReplicator) ReplicateLogs() {
         return
     }
 
-    log.Println(repl.leader.rf.me,
+    dLog(repl.leader.rf.me,
                 "replicating logs to", repl.peer,
                 "at term", repl.prevLog.Term, "index", repl.prevLog.Index)
+
     for !repl.leader.Stopped() {
 
         request := &AppendEntriesArgs{}
@@ -446,7 +454,7 @@ func (committer *LogCommitter) CommitLogs() {
             // Only commit logs at current term
             success, l := committer.leader.rf.store.Read(replProgress[mid])
             if success && l.Term == committer.leader.rf.store.GetTerm() {
-                // log.Println(committer.leader.rf.me, ": advance commit index to", replProgress[mid])
+                dLog(committer.leader.rf.me, ": advance commit index to", replProgress[mid])
                 committer.leader.rf.store.SetCommitIndex(replProgress[mid])
             }
         } else {
@@ -485,7 +493,7 @@ func (candidate *RaftCandidate) Run() {
 
     if candidate.rf.state != CANDIDATE {
         // Log error
-        log.Println(candidate.rf.me, ": not in candidate state.")
+        dLog(candidate.rf.me, ": not in candidate state.")
         return
     }
 
@@ -502,7 +510,7 @@ func (candidate *RaftCandidate) Run() {
             newTerm := candidate.rf.store.IncrementTerm()
             latestLogTerm, latestLogIndex := candidate.rf.store.GetLatestLogTermAndIndex()
 
-            log.Println(candidate.rf.me, ": start vote at term", newTerm)
+            dLog(candidate.rf.me, ": start vote at term", newTerm)
             if !candidate.VoteAtTerm(newTerm, latestLogTerm, latestLogIndex) {
                 st := rand.Int31n(512) + 256
                 // log.Println(candidate.rf.me, "round", newTerm, "failed. sleep", st)
@@ -525,7 +533,7 @@ func (candidate *RaftCandidate) Run() {
             }
         case isNewLeader := <- candidate.voteChan:
             if isNewLeader {
-                log.Println(candidate.rf.me, "win vote")
+                dLog(candidate.rf.me, "win vote")
                 candidate.Stop()
                 candidate.rf.setState(LEADER)
                 candidate.rf.store.SetVotedFor(candidate.rf.me)
@@ -568,7 +576,7 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
             continue
         }
         if candidate.Stopped() {
-            log.Println(candidate.rf.me, ": candidate stopped.")
+            dLog(candidate.rf.me, ": candidate stopped.")
             return true
         }
 
@@ -576,6 +584,7 @@ func (candidate *RaftCandidate) VoteAtTerm(newTerm, latestLogTerm, latestLogInde
             defer func() {
                 if r := recover(); r != nil {
                     // ignore error
+                    dLog(candidate.rf.me, r)
                 }
             } ()
 
@@ -721,8 +730,8 @@ func (follower *RaftFollower) Run() {
                     follower.rf.store.SetTerm(op.VoteRequest.Term)
                 }
 
-                log.Println(follower.rf.me, ": follower votes candidate",
-                            op.VoteRequest.CandidateId, success)
+                dLog(follower.rf.me, ": follower votes candidate",
+                     op.VoteRequest.CandidateId, success)
                 if success {
                     lastSawAppend = time.Now().UnixNano()
                 }
@@ -762,7 +771,7 @@ func (follower *RaftFollower) Run() {
             if tt > int64(time.Second) {
                 follower.rf.setState(CANDIDATE)
                 follower.Stop()
-                log.Println(follower.rf.me, "leader timeout: ", tt, int64(time.Second), "switch to candidate")
+                dLog(follower.rf.me, "leader timeout: ", tt, int64(time.Second), "switch to candidate")
                 return
             }
         case <- time.After(time.Second):
@@ -770,7 +779,7 @@ func (follower *RaftFollower) Run() {
             if tt > int64(time.Second) {
                 follower.rf.setState(CANDIDATE)
                 follower.Stop()
-                log.Println(follower.rf.me, "leader timeout: ", tt, int64(time.Second), "switch to candidate")
+                dLog(follower.rf.me, "leader timeout: ", tt, int64(time.Second), "switch to candidate")
                 return
             }
         }
@@ -794,8 +803,11 @@ type Log struct {
     Command interface{}
 }
 
-func HeartBeatLog() Log {
-    return Log{Term:-1, Index:-1, Command:nil}
+type PersistLog struct {
+    CurrentTerm int
+    VotedFor int
+    CommitIndex int
+    LL Log
 }
 
 type Store struct {
@@ -914,10 +926,8 @@ func (s *Store) LogMatch(server, term, index int) bool {
     }
 
     if s.logs[index].Term != term {
-        log.Println(s.rf.me,
-                    "follower log at index", index, "with term", s.logs[index].Term,
-                    "value", s.logs[index].Command,
-                    "does not match with server", server, "term", term)
+        dLog(s.rf.me, "follower log at index", index, "with term", s.logs[index].Term,
+             "value", s.logs[index].Command, "does not match with server", server, "term", term)
         return false
     }
 
@@ -962,13 +972,10 @@ func (s *Store) Propose(command interface{}) (int, int, bool) {
     if isLeader {
         newLog := Log{Term:nextLogTerm, Index:nextLogIndex, Command:command}
         s.logs = append(s.logs, newLog)
-        s.Persist(newLog)
+        s.rf.persist()
 
-        // log.Println(s.rf.me, "leader proposing log with index", newLog.Index,
-        //             "term", newLog.Term, "command", newLog.Command)
-        if command == nil {
-            log.Println(s.rf.me, "PROPOSE nil command ------------------- at index", nextLogIndex)
-        }
+        // dLog(s.rf.me, "leader proposing log with index", newLog.Index,
+        //      "term", newLog.Term, "command", newLog.Command)
     }
 
     return nextLogIndex, nextLogTerm, isLeader
@@ -992,10 +999,9 @@ func (s *Store) Append(newLogs []Log) {
         s.logs = append(s.logs, newLog)
         // log.Println(s.rf.me, "adding log with index", newLog.Index,
         //             "term", newLog.Term, "command", newLog.Command, "len", len(newLogs))
-        /* if newLog.Command == nil {
-            log.Println(s.rf.me, "APPEND WARNING: nil command at index", newLog.Index)
-        } */
-        s.Persist(newLog)
+
+        // s.Persist(newLog)
+        s.rf.persist()
     }
 }
 
@@ -1043,72 +1049,6 @@ func (s *Store) ApplyLogs(applyTo int) {
         //             "command", applyMsg.Command,
         //             "start", start, "commit index", applyTo)
     }
-
-    // Persist state
-    // s.rf.persist()
-}
-
-//
-// Used internally by other methods
-//
-func (s *Store) Persist(l Log) {
-    e := gob.NewEncoder(s.raftState)
-
-    e.Encode(s.currentTerm)
-    e.Encode(s.votedFor)
-    e.Encode(s.commitIndex)
-    e.Encode(s.applyIndex)
-    e.Encode(l.Term)
-    e.Encode(l.Index)
-    // Using & will correct encode the Command
-    e.Encode(&l.Command)
-    if l.Command == nil {
-        log.Println(s.rf.me, "PERSIST BAD: *** NIL COMMAND AT TERM",
-                    l.Term, "INDEX", l.Index)
-    }
-
-    // log.Println(s.rf.me, "persist raft state len:", s.raftState.Len(),
-    //             "command", l.Term, l.Index, l.Command)
-    s.rf.persister.SaveRaftState(s.raftState.Bytes())
-}
-
-func (s *Store) ReadPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-
-    dataCopy := make([]byte, len(data))
-    copy(dataCopy, data)
-    s.raftState = bytes.NewBuffer(dataCopy)
-
-    r := bytes.NewBuffer(data)
-    d := gob.NewDecoder(r)
-    for {
-        if d.Decode(&s.currentTerm) != nil {
-            break;
-        }
-
-        d.Decode(&s.votedFor)
-        d.Decode(&s.commitIndex)
-        d.Decode(&s.applyIndex)
-
-        var l Log
-        d.Decode(&l.Term)
-        d.Decode(&l.Index)
-        d.Decode(&l.Command)
-        if l.Command == nil {
-            log.Println(s.rf.me, "RECOVER BAD: GOT NIL COMMAND AT TERM", l.Term, "INDEX", l.Index)
-        }
-        if l.Index < len(s.logs) {
-            s.logs[l.Index] = l
-        } else {
-            s.logs = append(s.logs, l)
-        }
-    }
-
-    // log.Println(s.rf.me, "recover data --- term", s.currentTerm,
-    //             "commit", s.commitIndex, "apply", s.applyIndex,
-    //             "log length", len(s.logs))
 }
 
 //
@@ -1307,9 +1247,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
     index, term, isLeader = rf.store.Propose(command)
-    if isLeader {
-        // log.Println(rf.me, "propose new command at index", index, "command", command)
-    }
 	return index, term, isLeader
 }
 
@@ -1323,7 +1260,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
     atomic.StoreInt32(&rf.stop, 1)
     if rf.role != nil {
-        log.Println(rf.me, ": stop.")
+        dLog(rf.me, ": stop.")
         rf.role.Stop()
     }
     close(rf.queue)
@@ -1359,8 +1296,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.queue = make(chan *RaftOperation, 1)
 
 	// Initialize from state persisted before a crash
-	// rf.readPersist(persister.ReadRaftState())
-    rf.store.ReadPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState())
 
     // Start this peer
     rf.run()
