@@ -51,18 +51,52 @@ func (r KVIndexRow) Less(i, j int) bool {
 
 type KVIndex struct {
 	mu      sync.Mutex
+    kv *RaftKV
+    seqSeen int
     mp map[string][]KVIndexCell
 }
 
-func MakeKVIndex() *KVIndex {
+func MakeKVIndex(kv *RaftKV) *KVIndex {
     index :=  &KVIndex{}
+    index.kv = kv
+    index.seqSeen = 0
     index.mp = make(map[string][]KVIndexCell)
     return index
 }
 
-func (index *KVIndex) Get(op *Op) string {
+func (index *KVIndex) Apply(msg *raft.ApplyMsg) string {
     index.mu.Lock()
     defer index.mu.Unlock()
+
+    if index.seqSeen >= msg.Index {
+        //
+    } else {
+        if index.seqSeen + 1 != msg.Index {
+            panic("Sequence number gap!")
+        }
+        index.seqSeen = msg.Index
+
+        if index.kv.maxraftstate < index.kv.persister.RaftStateSize() {
+        }
+    }
+
+    op := msg.Command.(Op)
+    if msg.Command == nil {
+        panic("WARNING: got NIL command!!!")
+    }
+
+    if op.Type == GETOP {
+        return index.Get(&op)
+    }
+
+    if op.Type == PUTAPPENDOP {
+        index.PutAppend(&op)
+    }
+
+    return ""
+}
+
+func (index *KVIndex) Get(op *Op) string {
     if op.Type != GETOP {
         return ""
     }
@@ -85,8 +119,6 @@ func (index *KVIndex) Get(op *Op) string {
 }
 
 func (index *KVIndex) PutAppend(op *Op) {
-    index.mu.Lock()
-    defer index.mu.Unlock()
     if op.Type != PUTAPPENDOP {
         return
     }
@@ -117,6 +149,35 @@ func (index *KVIndex) PutAppend(op *Op) {
         ValueOp:op.ValueOp}
     index.mp[op.Key] = append(index.mp[op.Key], cell)
     sort.Sort(KVIndexRow(index.mp[op.Key]))
+}
+
+func (index *KVIndex) Compact() {
+    index.mu.Lock()
+    defer index.mu.Unlock()
+
+    newMp := make(map[string][]KVIndexCell)
+
+    for k, row := range(index.mp) {
+        value := ""
+        for _, cell := range(row) {
+            if cell.ValueOp == "Put" {
+                value = cell.Value
+            } else if cell.ValueOp == "Append" {
+                value += cell.Value
+            }
+        }
+
+        ts := time.Now().UnixNano()
+        cell := KVIndexCell{
+            Timestamp:ts,
+            RequestId:ts,
+            Value:value,
+            ValueOp:"Put"}
+        newMp[k] = make([]KVIndexCell, 0)
+        newMp[k] = append(newMp[k], cell)
+    }
+
+    index.mp = newMp
 }
 
 const (
@@ -164,6 +225,7 @@ type RaftKV struct {
 	// Your definitions here.
     stop int32
     index *KVIndex
+    persister *raft.Persister
     callbacks map[int]*OpCallback
 }
 
@@ -181,16 +243,13 @@ func (kv *RaftKV) DelCallback(seq int) {
     delete(kv.callbacks, seq)
 }
 
-func (kv *RaftKV) InvokeCallback(seq int, op *Op) {
+func (kv *RaftKV) InvokeCallback(msg *raft.ApplyMsg) {
     kv.mu.Lock()
     defer kv.mu.Unlock()
 
-    var value string = ""
-    if op.Type == GETOP {
-        value = kv.index.Get(op)
-    } else if op.Type == PUTAPPENDOP {
-        kv.index.PutAppend(op)
-    }
+    value := kv.index.Apply(msg)
+    seq := msg.Index
+    op := msg.Command.(Op)
 
     _, prs := kv.callbacks[seq]
     if !prs {
@@ -245,12 +304,7 @@ func (kv *RaftKV) ApplyLogs() {
         for !kv.Killed() {
             select {
             case msg := <- kv.applyCh:
-                if msg.Command == nil {
-                    log.Println(kv.me, "WARNING: got NIL command!!!")
-                    continue
-                }
-                op := msg.Command.(Op)
-                kv.InvokeCallback(msg.Index, &op)
+                kv.InvokeCallback(&msg)
             case <- time.After(time.Second):
                 // Noop
             }
@@ -259,14 +313,11 @@ func (kv *RaftKV) ApplyLogs() {
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
     op := Op{}
     op.Type = GETOP
     op.Key = args.Key
     op.RequestId = args.RequestId
     op.Timestamp = args.Timestamp
-    // op.GetRequest = args
-    // op.PutAppendRequest = nil
 
     seq, _, isLeader := kv.rf.Start(op)
     if !isLeader {
@@ -285,7 +336,6 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
     op := Op{}
     op.Type = PUTAPPENDOP
     op.Key = args.Key
@@ -293,8 +343,6 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
     op.ValueOp = args.Op
     op.RequestId = args.RequestId
     op.Timestamp = args.Timestamp
-    // op.GetRequest = nil
-    // op.PutAppendRequest = args
 
     seq, _, isLeader := kv.rf.Start(op)
     if !isLeader {
@@ -355,10 +403,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+    kv.persister = persister
 
 	// You may need initialization code here.
     kv.stop = 0
-    kv.index = MakeKVIndex()
+    kv.index = MakeKVIndex(kv)
     kv.callbacks = make(map[int]*OpCallback)
     kv.ApplyLogs()
 
